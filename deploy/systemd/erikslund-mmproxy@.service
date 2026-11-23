@@ -1,0 +1,67 @@
+# Run one hardened erikslund-mmproxy instance per listener and transport.
+# Instance "tcp" reads /etc/erikslund-mmproxy/tcp.env.
+
+[Unit]
+Description=Erikslund mmproxy (%i)
+# Every instance shares the reply routes, so a separate unit owns them.
+Requires=erikslund-mmproxy-routes.service
+After=erikslund-mmproxy-routes.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/erikslund-mmproxy/%i.env
+ExecStart=/usr/local/bin/erikslund-mmproxy $MMPROXY_ARGS
+Restart=on-failure
+RestartSec=2s
+# SIGHUP is not a reload: it ends the daemon, and systemd would count that as a clean exit.
+RestartForceExitStatus=SIGHUP
+
+# Resources: sized for the default cap of 65,536 connections. Each holds up to six descriptors, so
+# 400,000 covers the cap at any worker count. 65,536 idle connections use about 530 MiB, and near
+# MemoryMax the daemon closes the connections holding the most bytes. 64 workers fit in TasksMax.
+LimitNOFILE=400000
+MemoryMax=2048M
+TasksMax=128
+
+# Identity: a throwaway UID that holds only the transparent-socket capability.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+
+# Filesystem: the OS is read-only; home directories, /tmp, /dev and other processes are hidden.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+
+# Kernel: no tunables, modules, kernel logs, clock, hostname or cgroup changes.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Process: no writable code, new namespaces, realtime scheduling, SUID files or SysV IPC.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+PrivateIPC=yes
+
+# System calls: the systemd service baseline without privileged, resource-tuning or io_uring
+# calls. io_uring requests would bypass this system call filter entirely.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @aio
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

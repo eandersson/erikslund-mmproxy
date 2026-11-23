@@ -1,0 +1,11 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  -performance-enum-size,
+  clang-analyzer-*,
+  portability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/mmproxy/'
+FormatStyle: none

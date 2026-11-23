@@ -1,0 +1,4 @@
+# Use the immediate relay addresses as seen by the proxy.
+# Replace these documentation addresses before deployment.
+192.0.2.25/32
+2001:db8:42::25/128

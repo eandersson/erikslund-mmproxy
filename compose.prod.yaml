@@ -1,0 +1,43 @@
+services:
+  proxy:
+    build:
+      context: .
+      target: runtime
+    network_mode: host
+    entrypoint:
+      - setpriv
+      - --reuid=${MMPROXY_UID:?Set MMPROXY_UID to a host UID that nothing else uses}
+      - --regid=${MMPROXY_UID:?Set MMPROXY_UID to a host UID that nothing else uses}
+      - --clear-groups
+      - --inh-caps=-all,+net_raw
+      - --ambient-caps=-all,+net_raw
+      - --bounding-set=-all,+net_raw
+      - /opt/mmproxy/bin/erikslund-mmproxy
+    command:
+      - --protocol
+      - ${MMPROXY_PROTOCOL:-tcp}
+      - --listen
+      - ${MMPROXY_LISTEN:?Set MMPROXY_LISTEN to the ingress IP and port}
+      - --backend-v4
+      - ${MMPROXY_BACKEND_V4:?Set MMPROXY_BACKEND_V4 to the loopback backend and port}
+      - --allowed-subnets
+      - /etc/mmproxy/allowed-subnets.txt
+    volumes:
+      - type: bind
+        source: ${MMPROXY_ALLOWED_SUBNETS:?Set MMPROXY_ALLOWED_SUBNETS to the allow-list file path}
+        target: /etc/mmproxy/allowed-subnets.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    cap_drop: [ALL]
+    cap_add: [NET_RAW, SETPCAP, SETUID, SETGID]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 2048m
+    cpus: 4.0
+    ulimits:
+      nofile:
+        soft: 400000
+        hard: 400000
+    restart: unless-stopped

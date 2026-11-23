@@ -1,0 +1,20 @@
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    user: "1000:1000"
+    network_mode: none
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    pids_limit: 128
+    mem_limit: 2048m
+    cpus: 2.0
+    volumes:
+      - .:/workspace:ro
+      - dev-build:/build
+
+volumes:
+  dev-build:

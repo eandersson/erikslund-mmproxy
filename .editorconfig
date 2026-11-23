@@ -1,0 +1,29 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Web sources use 2-space indentation.
+[*.{js,jsx,ts,tsx,css,scss,html,json,yml,yaml}]
+indent_size = 2
+
+# C/C++ — 4 spaces, no tabs (matches the hand-held house style).
+[*.{c,cc,cpp,h,hpp}]
+indent_size = 4
+
+# Python — 4 spaces (ruff/PEP 8).
+[*.py]
+indent_size = 4
+
+# Makefiles require real tabs.
+[Makefile]
+indent_style = tab
+
+# Markdown: keep trailing whitespace (two trailing spaces is a hard line break).
+[*.md]
+trim_trailing_whitespace = false

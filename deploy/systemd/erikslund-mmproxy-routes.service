@@ -1,0 +1,49 @@
+[Unit]
+Description=Policy routes for erikslund-mmproxy backend replies
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Delete BEFORE adding, so a restart after an unclean stop never stacks duplicates. Full selectors
+# leave other services' rules alone, and the route exists before the rule that points to it.
+ExecStart=-/usr/sbin/ip -4 rule del priority 10000 from 127.0.0.0/8 iif lo lookup 123
+ExecStart=/usr/sbin/ip -4 route replace local 0.0.0.0/0 dev lo table 123
+ExecStart=/usr/sbin/ip -4 rule add priority 10000 from 127.0.0.0/8 iif lo lookup 123
+# IPv6 commands fail on an IPv4-only host, so their failures are ignored.
+ExecStart=-/usr/sbin/ip -6 rule del priority 10000 from ::1/128 iif lo lookup 123
+ExecStart=-/usr/sbin/ip -6 route replace local ::/0 dev lo table 123
+ExecStart=-/usr/sbin/ip -6 rule add priority 10000 from ::1/128 iif lo lookup 123
+# ExecStopPost also runs after a failed start, so a partial setup never lingers.
+ExecStopPost=-/usr/sbin/ip -4 rule del priority 10000 from 127.0.0.0/8 iif lo lookup 123
+ExecStopPost=-/usr/sbin/ip -4 route del local 0.0.0.0/0 dev lo table 123
+ExecStopPost=-/usr/sbin/ip -6 rule del priority 10000 from ::1/128 iif lo lookup 123
+ExecStopPost=-/usr/sbin/ip -6 route del local ::/0 dev lo table 123
+
+# Hardening: root with only CAP_NET_ADMIN, and nothing to touch but routing tables.
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

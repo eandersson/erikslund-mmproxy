@@ -20,12 +20,12 @@ Balancer::Balancer(std::size_t workers) : slots_(workers) {
 
 std::size_t Balancer::choose(std::size_t accepting_worker) const noexcept {
     std::size_t chosen = accepting_worker;
-    auto fewest = slots_[accepting_worker].connections.load(std::memory_order_relaxed);
+    auto fewest = slots_[accepting_worker].assigned_clients.load(std::memory_order_relaxed);
     for (std::size_t worker = 0; worker < slots_.size(); ++worker) {
-        const auto connections = slots_[worker].connections.load(std::memory_order_relaxed);
-        if (connections < fewest) {
+        const auto assigned = slots_[worker].assigned_clients.load(std::memory_order_relaxed);
+        if (assigned < fewest) {
             chosen = worker;
-            fewest = connections;
+            fewest = assigned;
         }
     }
     return chosen;
@@ -33,7 +33,7 @@ std::size_t Balancer::choose(std::size_t accepting_worker) const noexcept {
 
 void Balancer::hand_off(std::size_t worker, Handoff handoff) {
     auto& slot = slots_[worker];
-    slot.connections.fetch_add(1, std::memory_order_relaxed);
+    slot.assigned_clients.fetch_add(1, std::memory_order_relaxed);
     {
         const std::lock_guard guard(slot.lock);
         slot.inbox.push_back(std::move(handoff));
@@ -54,11 +54,11 @@ std::vector<Handoff> Balancer::take_handoffs(std::size_t worker) {
 }
 
 void Balancer::opened(std::size_t worker) noexcept {
-    slots_[worker].connections.fetch_add(1, std::memory_order_relaxed);
+    slots_[worker].assigned_clients.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Balancer::closed(std::size_t worker) noexcept {
-    slots_[worker].connections.fetch_sub(1, std::memory_order_relaxed);
+    slots_[worker].assigned_clients.fetch_sub(1, std::memory_order_relaxed);
 }
 
 int Balancer::inbox_descriptor(std::size_t worker) const noexcept {

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <compare>
@@ -164,10 +163,6 @@ public:
             free_slots_.push_back(remaining - 1);
     }
 
-    ~UdpWorker() {
-        metrics_.active.fetch_sub(idle_order_.size(), std::memory_order_relaxed);
-    }
-
     UdpWorker(const UdpWorker&) = delete;
     UdpWorker& operator=(const UdpWorker&) = delete;
 
@@ -236,10 +231,8 @@ private:
     }
 
     void expire_flows(Clock::time_point now) {
-        while (!idle_order_.empty() && flows_[idle_order_.front()].deadline <= now) {
+        while (!idle_order_.empty() && flows_[idle_order_.front()].deadline <= now)
             close_flow(idle_order_.front());
-            metrics_.count_timeout(TimeoutPhase::Idle);
-        }
     }
 
     void close_flow(std::size_t slot) {
@@ -249,7 +242,6 @@ private:
         leave_network(flow);
         flow.backend.reset();
         free_slots_.push_back(slot);
-        metrics_.active.fetch_sub(1, std::memory_order_relaxed);
     }
 
     void join_network(std::size_t slot, const IpAddress& network) {
@@ -291,13 +283,13 @@ private:
         increment(metrics_.flows_evicted);
     }
 
-    void refresh(Flow& flow, Clock::time_point now) {
+    void refresh_idle_deadline(Flow& flow, Clock::time_point now) {
         flow.deadline = now + config_.udp_timeout;
         idle_order_.splice(idle_order_.end(), idle_order_, flow.idle_position);
     }
 
-    void refresh_client(Flow& flow, Clock::time_point now) {
-        refresh(flow, now);
+    void record_client_activity(Flow& flow, Clock::time_point now) {
+        refresh_idle_deadline(flow, now);
         flow.last_client = now;
         auto& order = flow.network_entry->second;
         order.splice(order.end(), order, flow.network_position);
@@ -372,8 +364,7 @@ private:
     void forward_to_backend(std::size_t slot, std::span<const std::uint8_t> payload,
                             Clock::time_point now) {
         auto& flow = flows_[slot];
-        const auto sent = ::send(flow.backend.get(), payload.data(), payload.size(), MSG_NOSIGNAL);
-        if (sent < 0) {
+        if (::send(flow.backend.get(), payload.data(), payload.size(), MSG_NOSIGNAL) < 0) {
             if (!is_retryable(errno)) {
                 metrics_.count_backend_failure(BackendFailure::Forwarding);
                 close_flow(slot);
@@ -381,8 +372,7 @@ private:
             count_drop();
             return;
         }
-        increment(metrics_.client_to_backend_bytes, static_cast<std::uint64_t>(sent));
-        refresh_client(flow, now);
+        record_client_activity(flow, now);
     }
 
     std::optional<std::size_t> find_or_open_flow(const FlowKey& key, const ReplyPath& path,
@@ -443,9 +433,7 @@ private:
         flow.reply_path = path;
         flow.backend = std::move(backend);
         free_slots_.pop_back();
-        increment(metrics_.active);
-        increment(metrics_.accepted);
-        refresh_client(flow, now);
+        record_client_activity(flow, now);
         return slot;
     }
 
@@ -454,7 +442,6 @@ private:
         const auto now = Clock::now();
         if (now - flow.last_client > client_silence_limit_) {
             close_flow(slot);
-            metrics_.count_timeout(TimeoutPhase::Idle);
             return;
         }
         for (std::size_t packet = 0; packet < kPacketsPerEvent; ++packet) {
@@ -477,15 +464,11 @@ private:
                 continue;
             }
 
-            const auto sent = send_reply(listener_.get(), flow.reply_path,
-                                         std::span(packet_).first(size));
-            if (sent < 0) {
+            if (send_reply(listener_.get(), flow.reply_path, std::span(packet_).first(size)) < 0) {
                 count_drop();
                 continue;
             }
-
-            increment(metrics_.backend_to_client_bytes, static_cast<std::uint64_t>(sent));
-            refresh(flow, now);
+            refresh_idle_deadline(flow, now);
         }
     }
 

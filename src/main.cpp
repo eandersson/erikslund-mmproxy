@@ -77,8 +77,7 @@ Problems count_problems(const std::vector<Metrics>& metrics) {
     for (const auto& shard : metrics) {
         total.untrusted += shard.untrusted.load(kRelaxed);
         total.invalid_header += shard.invalid_header.load(kRelaxed);
-        total.header_timeouts +=
-            shard.timeouts[static_cast<std::size_t>(TimeoutPhase::Header)].load(kRelaxed);
+        total.header_timeouts += shard.header_timeouts.load(kRelaxed);
         total.limit_reached += shard.limit_reached.load(kRelaxed);
         total.memory_shed += shard.memory_shed.load(kRelaxed);
         total.share_refused += shard.share_refused.load(kRelaxed);

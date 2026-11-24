@@ -70,13 +70,13 @@ TEST_CASE("PROXY headers forward IPv4-mapped clients as IPv4") {
         bytes("PROXY TCP6 ::ffff:192.0.2.20 ::ffff:198.51.100.5 12345 443\r\n"),
         ProxyTransport::Stream);
     REQUIRE(v1.has_value());
-    CHECK(*v1->source == expected_source);
-    CHECK(*v1->destination == expected_destination);
+    CHECK(v1->source == expected_source);
+    CHECK(v1->destination == expected_destination);
 
     const auto v2 = parse_proxy_header(kMappedStreamHeader, ProxyTransport::Stream);
     REQUIRE(v2.has_value());
-    CHECK(*v2->source == expected_source);
-    CHECK(*v2->destination == expected_destination);
+    CHECK(v2->source == expected_source);
+    CHECK(v2->destination == expected_destination);
     CHECK(v2->size == kMappedStreamHeader.size());
 }
 

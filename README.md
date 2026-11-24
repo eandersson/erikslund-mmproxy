@@ -66,18 +66,26 @@ proxy on the host's private relay-facing IP at port `8443`.
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin mmproxy
    ```
 
-9. Start the proxy as that account. `MMPROXY_LISTEN` must be an address assigned to the host. For
-   UDP, also set `MMPROXY_PROTOCOL=udp`.
+9. Write the proxy settings to `.env`, which Docker Compose reads for every command.
+   `MMPROXY_LISTEN` must be an address assigned to the host. For UDP, also add
+   `MMPROXY_PROTOCOL=udp`.
 
    ```bash
-   MMPROXY_UID=$(id -u mmproxy) \
-   MMPROXY_LISTEN=10.42.0.10:8443 \
-   MMPROXY_BACKEND_V4=127.0.0.1:3333 \
-   MMPROXY_ALLOWED_SUBNETS=./conf/allowed-subnets.txt \
-   docker compose -f compose.prod.yaml up --build -d
+   cat > .env <<EOF
+   MMPROXY_UID=$(id -u mmproxy)
+   MMPROXY_LISTEN=10.42.0.10:8443
+   MMPROXY_BACKEND_V4=127.0.0.1:3333
+   MMPROXY_ALLOWED_SUBNETS=./conf/allowed-subnets.txt
+   EOF
    ```
 
-10. Check the log for the ready line, such as
+10. Start the proxy as that account.
+
+    ```bash
+    docker compose -f compose.prod.yaml up --build -d
+    ```
+
+11. Check the log for the ready line, such as
     `mmproxy 0.1.0 ready (4 workers, 65536 connections or flows)`.
 
     ```bash

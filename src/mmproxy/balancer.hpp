@@ -29,7 +29,7 @@ public:
 
 private:
     struct alignas(64) Slot {
-        std::atomic_size_t connections{0};
+        std::atomic_size_t assigned_clients{0};
         std::mutex lock;
         std::vector<Handoff> inbox;
         FileDescriptor wakeup;

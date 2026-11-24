@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -65,7 +64,6 @@ enum class Result {
     Keep,
     Done,
     ClientClosed,
-    ClosedBeforeHeader,
     InvalidHeader,
     BackendFailed,
     ResourceLimit,
@@ -185,7 +183,6 @@ struct Connection {
     Direction to_backend;
     Direction to_client;
     Phase phase = Phase::Header;
-    BackendFailure backend_failure = BackendFailure::Forwarding;
     Clock::time_point expires_at{};
     std::optional<DeadlineQueue::iterator> deadline_position;
     std::optional<IpAddress> counted_client;
@@ -306,31 +303,25 @@ PumpStatus finish_direction(Direction& direction, int destination) {
     return PumpStatus::DestinationFailed;
 }
 
-PumpStatus send_staged(Direction& direction, int destination, std::atomic_uint64_t& counter,
-                       bool& moved) {
+PumpStatus send_staged(Direction& direction, int destination, bool& moved) {
     const auto unsent = std::span(direction.staged).subspan(direction.staged_sent);
     const auto sent = ::send(destination, unsent.data(), unsent.size(), MSG_NOSIGNAL);
     if (sent <= 0)
         return sent < 0 && is_retryable(errno) ? PumpStatus::Ok : PumpStatus::DestinationFailed;
-    const auto size = static_cast<std::size_t>(sent);
-    direction.staged_sent += size;
-    increment(counter, size);
+    direction.staged_sent += static_cast<std::size_t>(sent);
     moved = true;
     direction.release_staged_if_sent();
     return PumpStatus::Ok;
 }
 
-PumpStatus drain_pipe(Direction& direction, int destination, PipePool& pipes,
-                      std::atomic_uint64_t& counter, bool& moved) {
+PumpStatus drain_pipe(Direction& direction, int destination, PipePool& pipes, bool& moved) {
     if (!direction.pipe)
         return PumpStatus::DestinationFailed;
     const auto sent = ::splice(direction.pipe->read_end.get(), nullptr, destination, nullptr,
                                direction.piped_bytes, kSpliceFlags);
     if (sent <= 0)
         return sent < 0 && is_retryable(errno) ? PumpStatus::Ok : PumpStatus::DestinationFailed;
-    const auto size = static_cast<std::size_t>(sent);
-    direction.piped_bytes -= size;
-    increment(counter, size);
+    direction.piped_bytes -= static_cast<std::size_t>(sent);
     moved = true;
     if (direction.piped_bytes == 0 && !direction.use_splice)
         pipes.release(direction.pipe);
@@ -338,7 +329,7 @@ PumpStatus drain_pipe(Direction& direction, int destination, PipePool& pipes,
 }
 
 PumpStatus splice_through(Direction& direction, int source, int destination, PipePool& pipes,
-                          std::atomic_uint64_t& counter, bool& moved) {
+                          bool& moved) {
     for (std::size_t round = 0; round < kSpliceRoundsPerEvent; ++round) {
         if (!direction.pipe)
             direction.pipe = pipes.acquire();
@@ -357,7 +348,7 @@ PumpStatus splice_through(Direction& direction, int source, int destination, Pip
         direction.piped_bytes = static_cast<std::size_t>(received);
         direction.spliced_recently = true;
         direction.use_splice = direction.piped_bytes >= kMinimumSpliceBytes;
-        const auto status = drain_pipe(direction, destination, pipes, counter, moved);
+        const auto status = drain_pipe(direction, destination, pipes, moved);
         if (status != PumpStatus::Ok || direction.piped_bytes != 0 || !direction.use_splice)
             return status;
     }
@@ -365,8 +356,7 @@ PumpStatus splice_through(Direction& direction, int source, int destination, Pip
 }
 
 PumpStatus copy_through(Direction& direction, int source, int destination,
-                        std::span<std::uint8_t> scratch, std::atomic_uint64_t& counter,
-                        bool& moved) {
+                        std::span<std::uint8_t> scratch, bool& moved) {
     const auto received = ::recv(source, scratch.data(), scratch.size(), 0);
     if (received < 0)
         return is_retryable(errno) ? PumpStatus::Ok : PumpStatus::SourceFailed;
@@ -377,10 +367,8 @@ PumpStatus copy_through(Direction& direction, int source, int destination,
     if (sent < 0 && !is_retryable(errno))
         return PumpStatus::DestinationFailed;
     const auto delivered = sent > 0 ? static_cast<std::size_t>(sent) : std::size_t{0};
-    if (delivered > 0) {
-        increment(counter, delivered);
+    if (delivered > 0)
         moved = true;
-    }
     if (delivered < chunk.size()) {
         const auto unsent = chunk.subspan(delivered);
         direction.staged.assign(unsent.begin(), unsent.end());
@@ -390,30 +378,29 @@ PumpStatus copy_through(Direction& direction, int source, int destination,
 }
 
 PumpStatus pump(Direction& direction, int source, int destination, Readiness ready,
-                PipePool& pipes, std::span<std::uint8_t> scratch, std::atomic_uint64_t& counter,
-                bool& moved) {
+                PipePool& pipes, std::span<std::uint8_t> scratch, bool& moved) {
     if (direction.has_staged()) {
         if (!ready.destination_writable)
             return PumpStatus::Ok;
-        const auto status = send_staged(direction, destination, counter, moved);
+        const auto status = send_staged(direction, destination, moved);
         if (status != PumpStatus::Ok || direction.has_staged())
             return status;
     }
     if (direction.piped_bytes != 0) {
         if (!ready.destination_writable)
             return PumpStatus::Ok;
-        return drain_pipe(direction, destination, pipes, counter, moved);
+        return drain_pipe(direction, destination, pipes, moved);
     }
     if (direction.eof || !ready.source_readable)
         return PumpStatus::Ok;
     if (direction.use_splice) {
-        const auto status = splice_through(direction, source, destination, pipes, counter, moved);
+        const auto status = splice_through(direction, source, destination, pipes, moved);
         if (status != PumpStatus::CopyInstead)
             return status;
         pipes.release(direction.pipe);
         direction.use_splice = false;
     }
-    return copy_through(direction, source, destination, scratch, counter, moved);
+    return copy_through(direction, source, destination, scratch, moved);
 }
 
 class TcpWorker {
@@ -433,10 +420,6 @@ public:
         if (!update_events(epoll_.get(), balancer_.inbox_descriptor(worker_index_), kInboxToken,
                            inbox_events, EPOLLIN))
             throw_system_error("watch the worker inbox");
-    }
-
-    ~TcpWorker() {
-        metrics_.active.fetch_sub(connections_.size(), std::memory_order_relaxed);
     }
 
     TcpWorker(const TcpWorker&) = delete;
@@ -534,7 +517,6 @@ private:
         limit_orphan_lifetime(connection.backend, memory_pressure_, kOrphanTimeout);
         connections_.erase(entry);
         balancer_.closed(worker_index_);
-        metrics_.active.fetch_sub(1, std::memory_order_relaxed);
     }
 
     void remove_with_reset(Connections::iterator entry) {
@@ -546,13 +528,12 @@ private:
     void count_expiry(Phase phase) {
         switch (phase) {
         case Phase::Header:
-            metrics_.count_timeout(TimeoutPhase::Header);
+            increment(metrics_.header_timeouts);
             return;
         case Phase::Connecting:
             metrics_.count_backend_failure(BackendFailure::ConnectTimeout);
             return;
         case Phase::Forwarding:
-            metrics_.count_timeout(TimeoutPhase::Idle);
             return;
         }
     }
@@ -662,8 +643,6 @@ private:
         const auto id = next_id_++;
         const auto entry = connections_.try_emplace(id).first;
         auto& connection = entry->second;
-        increment(metrics_.active);
-        increment(metrics_.accepted);
         connection.client = std::move(client);
         connection.relay = relay;
         enter_phase(id, connection, Phase::Header, now, config_.header_timeout);
@@ -700,27 +679,24 @@ private:
                              backend_events);
     }
 
-    Result backend_failed(Connection& connection, BackendFailure failure) {
-        connection.backend_failure = failure;
+    Result backend_failed(BackendFailure failure) {
+        metrics_.count_backend_failure(failure);
         return Result::BackendFailed;
     }
 
-    Result side_failed(Connection& connection, Side side) {
+    Result side_failed(Side side) {
         if (side == Side::Backend)
-            return backend_failed(connection, BackendFailure::Forwarding);
+            return backend_failed(BackendFailure::Forwarding);
         return Result::ClientClosed;
     }
 
-    Result pump_failed(Connection& connection, PumpStatus status, Side source) {
-        const Side failed = status == PumpStatus::SourceFailed ? source : opposite(source);
-        return side_failed(connection, failed);
+    Result pump_failed(PumpStatus status, Side source) {
+        return side_failed(status == PumpStatus::SourceFailed ? source : opposite(source));
     }
 
     PumpStatus pump_from(Connection& connection, Side source, Readiness ready, bool& moved) {
-        auto& counter = source == Side::Client ? metrics_.client_to_backend_bytes :
-                                                 metrics_.backend_to_client_bytes;
         return pump(connection.direction_from(source), connection.socket(source),
-                    connection.socket(opposite(source)), ready, pipes_, scratch_, counter, moved);
+                    connection.socket(opposite(source)), ready, pipes_, scratch_, moved);
     }
 
     void salvage(Connection& connection, Side failed) {
@@ -733,9 +709,8 @@ private:
         if (!connection.to_backend.has_staged())
             return Result::Keep;
         bool moved = false;
-        if (send_staged(connection.to_backend, connection.backend.get(),
-                        metrics_.client_to_backend_bytes, moved) != PumpStatus::Ok)
-            return backend_failed(connection, BackendFailure::Forwarding);
+        if (send_staged(connection.to_backend, connection.backend.get(), moved) != PumpStatus::Ok)
+            return backend_failed(BackendFailure::Forwarding);
         return Result::Keep;
     }
 
@@ -745,18 +720,18 @@ private:
                                            connection.relay.address.family;
         const auto& endpoint = backend_for(config_, family);
         if (!endpoint)
-            return backend_failed(connection, BackendFailure::NoBackend);
+            return backend_failed(BackendFailure::NoBackend);
         auto backend = open_backend_socket(config_, *endpoint, header.source, SOCK_STREAM);
         if (!backend)
-            return backend_failed(connection, backend.error());
+            return backend_failed(backend.error());
         connection.backend = std::move(*backend);
         const auto address = to_socket_address(*endpoint);
         const bool connected =
             ::connect(connection.backend.get(), address.data(), address.length) == 0;
         if (!connected && errno != EINPROGRESS)
-            return backend_failed(connection, BackendFailure::Connect);
+            return backend_failed(BackendFailure::Connect);
         if (header.source && !is_bound_to(connection.backend, *header.source))
-            return backend_failed(connection, BackendFailure::Bind);
+            return backend_failed(BackendFailure::Bind);
         if (connected)
             return begin_forwarding(id, connection, now);
         enter_phase(id, connection, Phase::Connecting, now, config_.connect_timeout);
@@ -774,8 +749,7 @@ private:
         if (received < 0 && is_retryable(errno))
             return Result::Keep;
         if (received <= 0)
-            return connection.header_received == 0 ? Result::ClosedBeforeHeader :
-                                                     Result::InvalidHeader;
+            return connection.header_received == 0 ? Result::ClientClosed : Result::InvalidHeader;
 
         connection.header_received += static_cast<std::size_t>(received);
         const auto parsed = parse_proxy_header(
@@ -807,7 +781,7 @@ private:
         socklen_t length = sizeof(error);
         if (::getsockopt(connection.backend.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
             error != 0)
-            return backend_failed(connection, BackendFailure::Connect);
+            return backend_failed(BackendFailure::Connect);
         return begin_forwarding(id, connection, now);
     }
 
@@ -815,17 +789,17 @@ private:
                    Clock::time_point now) {
         if ((events & EPOLLERR) != 0) {
             salvage(connection, side);
-            return side_failed(connection, side);
+            return side_failed(side);
         }
         bool moved = false;
         const auto upload_ready = event_readiness(Side::Client, side, events);
         const auto upload = pump_from(connection, Side::Client, upload_ready, moved);
         if (upload != PumpStatus::Ok)
-            return pump_failed(connection, upload, Side::Client);
+            return pump_failed(upload, Side::Client);
         const auto download_ready = event_readiness(Side::Backend, side, events);
         const auto download = pump_from(connection, Side::Backend, download_ready, moved);
         if (download != PumpStatus::Ok)
-            return pump_failed(connection, download, Side::Backend);
+            return pump_failed(download, Side::Backend);
 
         if (connection.to_backend.eof && connection.to_client.eof)
             return Result::Done;
@@ -847,16 +821,10 @@ private:
         std::unreachable();
     }
 
-    void count_close(const Connection& connection, Result result) {
+    void count_close(Result result) {
         switch (result) {
-        case Result::ClosedBeforeHeader:
-            increment(metrics_.closed_before_header);
-            return;
         case Result::InvalidHeader:
             increment(metrics_.invalid_header);
-            return;
-        case Result::BackendFailed:
-            metrics_.count_backend_failure(connection.backend_failure);
             return;
         case Result::ResourceLimit:
             increment(metrics_.limit_reached);
@@ -867,6 +835,7 @@ private:
         case Result::Keep:
         case Result::Done:
         case Result::ClientClosed:
+        case Result::BackendFailed:
             return;
         }
     }
@@ -893,7 +862,7 @@ private:
                 return;
             result = Result::ResourceLimit;
         }
-        count_close(connection, result);
+        count_close(result);
         remove(entry);
     }
 

@@ -1,13 +1,13 @@
 #include "mmproxy/address.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <cstring>
 #include <span>
-#include <system_error>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+
+#include "mmproxy/number.hpp"
 
 namespace erikslund::mmproxy {
 
@@ -26,7 +26,7 @@ constexpr std::array<std::uint8_t, kIpv4AddressBytes> kIpv4BroadcastBytes{255, 2
 constexpr std::array<std::uint8_t, kIpv6AddressBytes> kIpv6LoopbackBytes{
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 constexpr std::size_t kMappedPrefixBytes = kIpv6AddressBytes - kIpv4AddressBytes;
-constexpr std::size_t kIpv6SourcePrefixBytes = 8;
+constexpr std::size_t kIpv6ClientNetworkBytes = 8;
 constexpr std::array<std::uint8_t, kMappedPrefixBytes> kNat64Prefix{
     0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0};
 constexpr std::array<std::uint8_t, kMappedPrefixBytes> kMappedPrefix{
@@ -44,7 +44,7 @@ IpAddress embedded_ipv4(const IpAddress& address) noexcept {
 }
 
 bool has_host_bits(const IpAddress& address, unsigned int prefix_bits) noexcept {
-    const std::size_t size = address.family == AF_INET ? kIpv4AddressBytes : kIpv6AddressBytes;
+    const std::size_t size = ip_address_size(address.family);
     for (std::size_t index = 0; index < size; ++index) {
         const auto first_bit = static_cast<unsigned int>(index * kBitsPerByte);
         const unsigned int network_bits =
@@ -73,9 +73,18 @@ bool matches_prefix(const IpAddress& address, const IpAddress& network,
 
 } // namespace
 
+std::size_t ip_address_size(int family) noexcept {
+    return family == AF_INET ? kIpv4AddressBytes : kIpv6AddressBytes;
+}
+
 bool IpAddress::is_loopback() const noexcept {
     return (family == AF_INET && bytes.front() == kIpv4LoopbackFirstByte) ||
            (family == AF_INET6 && bytes == kIpv6LoopbackBytes);
+}
+
+bool IpAddress::is_wildcard() const noexcept {
+    return std::ranges::all_of(std::span{bytes}.first(ip_address_size(family)),
+                               [](auto byte) { return byte == 0; });
 }
 
 const sockaddr* SocketAddress::data() const noexcept {
@@ -86,14 +95,14 @@ IpAddress unmap_ipv4(const IpAddress& address) noexcept {
     return is_ipv4_mapped(address) ? embedded_ipv4(address) : address;
 }
 
-IpAddress client_source(const IpAddress& address) noexcept {
-    IpAddress source = unmap_ipv4(address);
-    if (source.family != AF_INET6)
-        return source;
-    if (std::ranges::equal(std::span{source.bytes}.first<kMappedPrefixBytes>(), kNat64Prefix))
-        return embedded_ipv4(source);
-    std::ranges::fill(std::span{source.bytes}.subspan(kIpv6SourcePrefixBytes), 0);
-    return source;
+IpAddress client_network(const IpAddress& address) noexcept {
+    IpAddress network = unmap_ipv4(address);
+    if (network.family != AF_INET6)
+        return network;
+    if (std::ranges::equal(std::span{network.bytes}.first<kMappedPrefixBytes>(), kNat64Prefix))
+        return embedded_ipv4(network);
+    std::ranges::fill(std::span{network.bytes}.subspan(kIpv6ClientNetworkBytes), 0);
+    return network;
 }
 
 std::expected<IpAddress, AddressError> parse_ip_address(std::string_view text, int family) noexcept {
@@ -119,16 +128,10 @@ std::expected<IpAddress, AddressError> parse_ip_address(std::string_view text, i
 }
 
 std::expected<std::uint16_t, AddressError> parse_port(std::string_view text) noexcept {
-    if (text.empty())
+    const auto port = parse_number<std::uint16_t>(text);
+    if (!port)
         return std::unexpected(AddressError::InvalidPort);
-
-    std::uint16_t port{};
-    const char* const begin = text.data();
-    const char* const end = begin + text.size();
-    const auto [next, error] = std::from_chars(begin, end, port);
-    if (error != std::errc{} || next != end)
-        return std::unexpected(AddressError::InvalidPort);
-    return port;
+    return *port;
 }
 
 std::expected<Endpoint, AddressError> parse_endpoint(std::string_view text) noexcept {
@@ -205,13 +208,13 @@ bool usable_transparent_source(const Endpoint& endpoint) noexcept {
     const auto& bytes = endpoint.address.bytes;
     if (endpoint.address.family == AF_INET) {
         const auto ipv4 = std::span{bytes}.first<kIpv4AddressBytes>();
-        const bool wildcard = std::ranges::all_of(ipv4, [](auto byte) { return byte == 0; });
+        const bool wildcard = endpoint.address.is_wildcard();
         const bool multicast = (bytes.front() & kIpv4MulticastMask) == kIpv4MulticastPrefix;
         return !wildcard && !multicast && !std::ranges::equal(ipv4, kIpv4BroadcastBytes);
     }
 
     if (endpoint.address.family == AF_INET6) {
-        const bool wildcard = std::ranges::all_of(bytes, [](auto byte) { return byte == 0; });
+        const bool wildcard = endpoint.address.is_wildcard();
         const bool multicast = bytes.front() == kIpv6MulticastPrefix;
         const bool link_local = bytes.front() == kIpv6LinkLocalFirstByte &&
                                 (bytes[1] & kIpv6LinkLocalMask) == kIpv6LinkLocalSecondByte;
@@ -221,8 +224,12 @@ bool usable_transparent_source(const Endpoint& endpoint) noexcept {
     return false;
 }
 
-bool claim_fits_relay(const Endpoint& claimed, const Endpoint& relay) noexcept {
-    return !claimed.address.is_loopback() || relay.address.is_loopback();
+bool relay_may_claim(const Endpoint& relay, const Endpoint& claimed) noexcept {
+    return relay.address.is_loopback() || !claimed.address.is_loopback();
+}
+
+bool relay_may_claim(const Endpoint& relay, const std::optional<Endpoint>& claimed) noexcept {
+    return !claimed || relay_may_claim(relay, *claimed);
 }
 
 bool TrustList::add(std::string_view text) {
@@ -231,16 +238,14 @@ bool TrustList::add(std::string_view text) {
     if (!address)
         return false;
 
-    const auto max_prefix_bits = static_cast<unsigned int>(
-        (address->family == AF_INET ? kIpv4AddressBytes : kIpv6AddressBytes) * kBitsPerByte);
+    const auto max_prefix_bits =
+        static_cast<unsigned int>(ip_address_size(address->family) * kBitsPerByte);
     unsigned int prefix_bits = max_prefix_bits;
     if (separator != std::string_view::npos) {
-        const auto length_text = text.substr(separator + 1);
-        const char* const begin = length_text.data();
-        const char* const end = begin + length_text.size();
-        const auto [next, error] = std::from_chars(begin, end, prefix_bits);
-        if (error != std::errc{} || next != end || prefix_bits > max_prefix_bits)
+        const auto parsed = parse_number<unsigned int>(text.substr(separator + 1));
+        if (!parsed || *parsed > max_prefix_bits)
             return false;
+        prefix_bits = *parsed;
     }
 
     if (is_ipv4_mapped(*address)) {
@@ -266,9 +271,9 @@ bool TrustList::contains(const IpAddress& address) const noexcept {
 }
 
 bool TrustList::overlaps(const IpAddress& network, unsigned int prefix_bits,
-                         bool count_everyone) const noexcept {
+                         Everyone everyone) const noexcept {
     return std::ranges::any_of(networks_, [&](const Network& entry) {
-        const bool counted = count_everyone || entry.prefix_bits != 0;
+        const bool counted = everyone == Everyone::Count || entry.prefix_bits != 0;
         return counted && entry.address.family == network.family &&
                matches_prefix(entry.address, network, std::min(entry.prefix_bits, prefix_bits));
     });

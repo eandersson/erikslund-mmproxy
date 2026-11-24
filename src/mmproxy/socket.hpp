@@ -1,5 +1,5 @@
 #pragma once
-// Create proxy listeners and transparent upstream sockets.
+// Create proxy listeners and transparent backend sockets.
 
 #include <expected>
 #include <optional>
@@ -11,18 +11,19 @@
 
 namespace erikslund::mmproxy {
 
-class SocketError : public std::runtime_error {
+class SystemError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
 
-[[noreturn]] void throw_socket_error(const char* operation);
-[[nodiscard]] FileDescriptor make_listener(const Config& config, int socket_type);
+[[noreturn]] void throw_system_error(const char* operation);
+[[nodiscard]] bool is_retryable(int error) noexcept;
+[[nodiscard]] FileDescriptor make_listener(const Config& config);
 
-[[nodiscard]] std::expected<FileDescriptor, UpstreamFailure>
-open_upstream(const Config& config, const Endpoint& backend, const std::optional<Endpoint>& source,
-              int socket_type);
+[[nodiscard]] std::expected<FileDescriptor, BackendFailure>
+open_backend_socket(const Config& config, const Endpoint& backend,
+                    const std::optional<Endpoint>& source, int socket_type);
 
-void check_upstream_permissions(const Config& config);
+void check_backend_permissions(const Config& config);
 
 } // namespace erikslund::mmproxy

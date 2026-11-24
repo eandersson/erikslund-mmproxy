@@ -14,7 +14,7 @@ Balancer::Balancer(std::size_t workers) : slots_(workers) {
     for (auto& slot : slots_) {
         slot.wakeup = FileDescriptor(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
         if (!slot.wakeup)
-            throw_socket_error("open worker handoff descriptor");
+            throw_system_error("open worker handoff descriptor");
     }
 }
 
@@ -43,7 +43,7 @@ void Balancer::hand_off(std::size_t worker, Handoff handoff) {
         ::write(slot.wakeup.get(), &kOneClient, sizeof(kOneClient));
 }
 
-std::vector<Handoff> Balancer::take(std::size_t worker) {
+std::vector<Handoff> Balancer::take_handoffs(std::size_t worker) {
     auto& slot = slots_[worker];
     std::uint64_t queued = 0;
     [[maybe_unused]] const auto drained = ::read(slot.wakeup.get(), &queued, sizeof(queued));
@@ -61,7 +61,7 @@ void Balancer::closed(std::size_t worker) noexcept {
     slots_[worker].connections.fetch_sub(1, std::memory_order_relaxed);
 }
 
-int Balancer::wakeup(std::size_t worker) const noexcept {
+int Balancer::inbox_descriptor(std::size_t worker) const noexcept {
     return slots_[worker].wakeup.get();
 }
 

@@ -8,6 +8,7 @@
 #include <compare>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -36,7 +37,7 @@ constexpr std::size_t kMaxPacketBytes = 65'535;
 constexpr std::size_t kEventBatchSize = 64;
 constexpr std::size_t kPacketsPerEvent = 32;
 constexpr auto kStopCheckInterval = 250ms;
-constexpr std::uint64_t kListenerEvent = 0;
+constexpr std::uint64_t kListenerToken = 0;
 constexpr unsigned kSlotIdBits = 32;
 constexpr std::size_t kPacketInfoBytes = CMSG_SPACE(sizeof(in6_pktinfo));
 constexpr auto kMinClientSilenceLimit = std::chrono::minutes(5);
@@ -57,7 +58,7 @@ struct FlowKey {
 };
 
 using IdleOrder = std::list<std::size_t>;
-using Sources = std::map<IpAddress, IdleOrder>;
+using FlowsByNetwork = std::map<IpAddress, IdleOrder>;
 
 struct Flow {
     FileDescriptor backend;
@@ -65,8 +66,8 @@ struct Flow {
     ReplyPath reply_path{};
     IdleOrder::iterator idle_position;
     Clock::time_point deadline{};
-    Sources::iterator source_entry;
-    IdleOrder::iterator source_position;
+    FlowsByNetwork::iterator network_entry;
+    IdleOrder::iterator network_position;
     Clock::time_point last_client{};
     std::uint32_t generation{};
 };
@@ -140,11 +141,7 @@ ssize_t send_reply(int listener_fd, const ReplyPath& path, std::span<std::uint8_
     return ::sendmsg(listener_fd, &message, MSG_NOSIGNAL);
 }
 
-bool is_again(int error) {
-    return error == EAGAIN || error == EWOULDBLOCK;
-}
-
-std::uint64_t event_key(std::size_t slot, std::uint32_t generation) {
+std::uint64_t flow_token(std::size_t slot, std::uint32_t generation) {
     return (static_cast<std::uint64_t>(generation) << kSlotIdBits) | (slot + 1);
 }
 
@@ -157,9 +154,9 @@ public:
           client_silence_limit_(
               std::max<Clock::duration>(config.udp_timeout, kMinClientSilenceLimit)) {
         if (!poller_)
-            throw_socket_error("create UDP poller");
-        if (!register_socket(listener_.get(), kListenerEvent))
-            throw_socket_error("register UDP listener");
+            throw_system_error("create UDP poller");
+        if (!register_socket(listener_.get(), kListenerToken))
+            throw_system_error("register UDP listener");
 
         flows_.resize(flow_limit);
         free_slots_.reserve(flow_limit);
@@ -184,7 +181,7 @@ public:
             if (ready < 0) {
                 if (errno == EINTR)
                     continue;
-                throw_socket_error("poll UDP sockets");
+                throw_system_error("poll UDP sockets");
             }
 
             expire_flows(Clock::now());
@@ -194,16 +191,16 @@ public:
     }
 
 private:
-    bool register_socket(int socket_fd, std::uint64_t key) const {
+    bool register_socket(int socket_fd, std::uint64_t token) const {
         epoll_event event{};
         event.events = EPOLLIN;
-        event.data.u64 = key;
+        event.data.u64 = token;
         return ::epoll_ctl(poller_.get(), EPOLL_CTL_ADD, socket_fd, &event) == 0;
     }
 
     void dispatch(const epoll_event& event) {
-        const std::uint64_t key = event.data.u64;
-        if (key == kListenerEvent) {
+        const std::uint64_t token = event.data.u64;
+        if (token == kListenerToken) {
             if ((event.events & EPOLLIN) != 0)
                 receive_client_packets();
             if ((event.events & EPOLLERR) != 0)
@@ -211,8 +208,8 @@ private:
             return;
         }
 
-        const auto slot_id = static_cast<std::uint32_t>(key);
-        const auto generation = static_cast<std::uint32_t>(key >> kSlotIdBits);
+        const auto slot_id = static_cast<std::uint32_t>(token);
+        const auto generation = static_cast<std::uint32_t>(token >> kSlotIdBits);
         if (slot_id == 0 || slot_id > flows_.size())
             return;
 
@@ -226,7 +223,7 @@ private:
         int socket_error{};
         socklen_t error_bytes = sizeof(socket_error);
         if (::getsockopt(listener_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &error_bytes) < 0)
-            throw_socket_error("clear UDP listener error");
+            throw_system_error("clear UDP listener error");
     }
 
     int wait_timeout(Clock::time_point now) const {
@@ -249,48 +246,49 @@ private:
         auto& flow = flows_[slot];
         flow_index_.erase(flow.key);
         idle_order_.erase(flow.idle_position);
-        leave_source(flow);
+        leave_network(flow);
         flow.backend.reset();
         free_slots_.push_back(slot);
         metrics_.active.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    void join_source(std::size_t slot, const IpAddress& source) {
+    void join_network(std::size_t slot, const IpAddress& network) {
         auto& flow = flows_[slot];
-        flow.source_entry = sources_.try_emplace(source).first;
-        auto& order = flow.source_entry->second;
+        flow.network_entry = flows_by_network_.try_emplace(network).first;
+        auto& order = flow.network_entry->second;
         if (!order.empty())
-            sources_by_size_.erase({order.size(), source});
+            networks_by_flow_count_.erase({order.size(), network});
         order.push_back(slot);
-        flow.source_position = std::prev(order.end());
-        sources_by_size_.emplace(order.size(), source);
+        flow.network_position = std::prev(order.end());
+        networks_by_flow_count_.emplace(order.size(), network);
     }
 
-    void leave_source(const Flow& flow) {
-        const auto source = flow.source_entry->first;
-        auto& order = flow.source_entry->second;
-        sources_by_size_.erase({order.size(), source});
-        order.erase(flow.source_position);
+    void leave_network(const Flow& flow) {
+        const auto network = flow.network_entry->first;
+        auto& order = flow.network_entry->second;
+        networks_by_flow_count_.erase({order.size(), network});
+        order.erase(flow.network_position);
         if (order.empty())
-            sources_.erase(flow.source_entry);
+            flows_by_network_.erase(flow.network_entry);
         else
-            sources_by_size_.emplace(order.size(), source);
+            networks_by_flow_count_.emplace(order.size(), network);
     }
 
-    [[nodiscard]] bool may_evict_for(const IpAddress& requester) const {
-        if (sources_by_size_.empty())
+    [[nodiscard]] bool may_evict_for(const IpAddress& network) const {
+        if (networks_by_flow_count_.empty())
             return false;
-        const auto largest_count = sources_by_size_.rbegin()->first;
-        const auto held = sources_.find(requester);
-        return held == sources_.end() || held->second.size() < largest_count;
+        const auto largest_count = networks_by_flow_count_.rbegin()->first;
+        const auto held = flows_by_network_.find(network);
+        return held == flows_by_network_.end() || held->second.size() < largest_count;
     }
 
     void evict_for_newcomer() {
-        const auto [largest_count, largest] = *sources_by_size_.rbegin();
-        const auto victim =
-            largest_count > 1 ? sources_.find(largest)->second.front() : idle_order_.front();
+        const auto [largest_count, largest_network] = *networks_by_flow_count_.rbegin();
+        const auto victim = largest_count > 1 ?
+                                flows_by_network_.find(largest_network)->second.front() :
+                                idle_order_.front();
         close_flow(victim);
-        metrics_.flows_evicted.fetch_add(1, std::memory_order_relaxed);
+        increment(metrics_.flows_evicted);
     }
 
     void refresh(Flow& flow, Clock::time_point now) {
@@ -301,22 +299,22 @@ private:
     void refresh_client(Flow& flow, Clock::time_point now) {
         refresh(flow, now);
         flow.last_client = now;
-        auto& order = flow.source_entry->second;
-        order.splice(order.end(), order, flow.source_position);
+        auto& order = flow.network_entry->second;
+        order.splice(order.end(), order, flow.network_position);
     }
 
-    void drop() const {
-        metrics_.udp_dropped.fetch_add(1, std::memory_order_relaxed);
+    void count_drop() const {
+        increment(metrics_.udp_dropped);
     }
 
     void receive_client_packets() {
         for (std::size_t packet = 0; packet < kPacketsPerEvent; ++packet) {
-            sockaddr_storage peer{};
+            sockaddr_storage relay_address{};
             alignas(cmsghdr) std::array<unsigned char, kPacketInfoBytes> control{};
             iovec bytes{.iov_base = packet_.data(), .iov_len = packet_.size()};
             msghdr message{};
-            message.msg_name = &peer;
-            message.msg_namelen = sizeof(peer);
+            message.msg_name = &relay_address;
+            message.msg_namelen = sizeof(relay_address);
             message.msg_iov = &bytes;
             message.msg_iovlen = 1;
             message.msg_control = control.data();
@@ -331,122 +329,122 @@ private:
 
             const auto size = static_cast<std::size_t>(received);
             if (size > packet_.size() || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
-                drop();
+                count_drop();
                 continue;
             }
-            handle_client_packet(peer, message, std::span(packet_).first(size));
+            handle_client_packet(relay_address, message, std::span(packet_).first(size));
         }
     }
 
-    void handle_client_packet(const sockaddr_storage& peer, msghdr& message,
+    void handle_client_packet(const sockaddr_storage& relay_address, msghdr& message,
                               std::span<const std::uint8_t> bytes) {
-        const auto relay = from_socket_address(peer);
+        const auto relay = from_socket_address(relay_address);
         if (!relay || !config_.trusted.contains(relay->address)) {
-            metrics_.untrusted.fetch_add(1, std::memory_order_relaxed);
-            drop();
+            increment(metrics_.untrusted);
+            count_drop();
             return;
         }
 
         const auto header = parse_proxy_header(bytes, ProxyTransport::Datagram);
-        if (!header) {
-            metrics_.invalid_header.fetch_add(1, std::memory_order_relaxed);
-            drop();
-            return;
-        }
-        const auto& claimed = header->source;
-        if (claimed && !claim_fits_relay(*claimed, *relay)) {
-            metrics_.invalid_header.fetch_add(1, std::memory_order_relaxed);
-            drop();
+        if (!header || !relay_may_claim(*relay, header->source)) {
+            increment(metrics_.invalid_header);
+            count_drop();
             return;
         }
 
         const auto reply_path = read_reply_path(message, *relay);
         if (!reply_path) {
-            drop();
+            count_drop();
             return;
         }
 
         const FlowKey key{.transparent = header->source.has_value(),
                           .endpoint = header->source.value_or(*relay)};
         const auto now = Clock::now();
-        const auto slot = get_flow(key, *reply_path, header->source, now);
+        const auto slot = find_or_open_flow(key, *reply_path, header->source, now);
         if (!slot) {
-            drop();
+            count_drop();
             return;
         }
+        forward_to_backend(*slot, bytes.subspan(header->size), now);
+    }
 
-        auto& flow = flows_[*slot];
-        const auto payload = bytes.subspan(header->size);
+    void forward_to_backend(std::size_t slot, std::span<const std::uint8_t> payload,
+                            Clock::time_point now) {
+        auto& flow = flows_[slot];
         const auto sent = ::send(flow.backend.get(), payload.data(), payload.size(), MSG_NOSIGNAL);
         if (sent < 0) {
-            const int error = errno;
-            if (!is_again(error) && error != EINTR) {
-                metrics_.count_upstream_error(UpstreamFailure::Relay);
-                close_flow(*slot);
+            if (!is_retryable(errno)) {
+                metrics_.count_backend_failure(BackendFailure::Forwarding);
+                close_flow(slot);
             }
-            drop();
+            count_drop();
             return;
         }
-
-        metrics_.client_to_backend_bytes.fetch_add(static_cast<std::uint64_t>(sent),
-                                                   std::memory_order_relaxed);
+        increment(metrics_.client_to_backend_bytes, static_cast<std::uint64_t>(sent));
         refresh_client(flow, now);
     }
 
-    std::optional<std::size_t> get_flow(const FlowKey& key, const ReplyPath& path,
-                                       const std::optional<Endpoint>& source,
-                                       Clock::time_point now) {
-        const auto existing = flow_index_.find(key);
-        if (existing != flow_index_.end()) {
+    std::optional<std::size_t> find_or_open_flow(const FlowKey& key, const ReplyPath& path,
+                                                 const std::optional<Endpoint>& claimed_source,
+                                                 Clock::time_point now) {
+        if (const auto existing = flow_index_.find(key); existing != flow_index_.end()) {
             if (flows_[existing->second].reply_path != path)
                 return std::nullopt;
             return existing->second;
         }
 
-        const auto client = client_source(key.endpoint.address);
+        const auto network = client_network(key.endpoint.address);
         const bool full = free_slots_.empty();
-        if (full && !may_evict_for(client)) {
-            metrics_.limit_reached.fetch_add(1, std::memory_order_relaxed);
+        if (full && !may_evict_for(network)) {
+            increment(metrics_.limit_reached);
             return std::nullopt;
         }
-
-        const auto& backend = backend_for(config_, key.endpoint.address.family);
+        auto backend = connect_backend(key.endpoint.address.family, claimed_source);
         if (!backend) {
-            metrics_.count_upstream_error(UpstreamFailure::NoBackend);
+            metrics_.count_backend_failure(backend.error());
             return std::nullopt;
         }
-
-        auto socket = open_upstream(config_, *backend, source, SOCK_DGRAM);
-        if (!socket) {
-            metrics_.count_upstream_error(socket.error());
-            return std::nullopt;
-        }
-        const auto destination = to_socket_address(*backend);
-        if (::connect(socket->get(), destination.data(), destination.length) < 0) {
-            metrics_.count_upstream_error(UpstreamFailure::Connect);
-            return std::nullopt;
-        }
-
         if (full)
             evict_for_newcomer();
+        return install_flow(std::move(*backend), key, path, network, now);
+    }
+
+    std::expected<FileDescriptor, BackendFailure>
+    connect_backend(int family, const std::optional<Endpoint>& claimed_source) const {
+        const auto& backend = backend_for(config_, family);
+        if (!backend)
+            return std::unexpected(BackendFailure::NoBackend);
+        auto socket = open_backend_socket(config_, *backend, claimed_source, SOCK_DGRAM);
+        if (!socket)
+            return socket;
+        const auto destination = to_socket_address(*backend);
+        if (::connect(socket->get(), destination.data(), destination.length) < 0)
+            return std::unexpected(BackendFailure::Connect);
+        return socket;
+    }
+
+    std::optional<std::size_t> install_flow(FileDescriptor backend, const FlowKey& key,
+                                            const ReplyPath& path, const IpAddress& network,
+                                            Clock::time_point now) {
         const auto slot = free_slots_.back();
         auto& flow = flows_[slot];
         ++flow.generation;
-        if (!register_socket(socket->get(), event_key(slot, flow.generation))) {
-            metrics_.count_upstream_error(UpstreamFailure::Setup);
+        if (!register_socket(backend.get(), flow_token(slot, flow.generation))) {
+            metrics_.count_backend_failure(BackendFailure::Setup);
             return std::nullopt;
         }
 
         flow_index_.emplace(key, slot);
         idle_order_.push_back(slot);
         flow.idle_position = std::prev(idle_order_.end());
-        join_source(slot, client);
+        join_network(slot, network);
         flow.key = key;
         flow.reply_path = path;
-        flow.backend = std::move(*socket);
+        flow.backend = std::move(backend);
         free_slots_.pop_back();
-        metrics_.active.fetch_add(1, std::memory_order_relaxed);
-        metrics_.accepted.fetch_add(1, std::memory_order_relaxed);
+        increment(metrics_.active);
+        increment(metrics_.accepted);
         refresh_client(flow, now);
         return slot;
     }
@@ -466,8 +464,8 @@ private:
                 const int error = errno;
                 if (error == EINTR)
                     continue;
-                if (!is_again(error)) {
-                    metrics_.count_upstream_error(UpstreamFailure::Relay);
+                if (!is_retryable(error)) {
+                    metrics_.count_backend_failure(BackendFailure::Forwarding);
                     close_flow(slot);
                 }
                 return;
@@ -475,19 +473,18 @@ private:
 
             const auto size = static_cast<std::size_t>(received);
             if (size > packet_.size()) {
-                drop();
+                count_drop();
                 continue;
             }
 
             const auto sent = send_reply(listener_.get(), flow.reply_path,
                                          std::span(packet_).first(size));
             if (sent < 0) {
-                drop();
+                count_drop();
                 continue;
             }
 
-            metrics_.backend_to_client_bytes.fetch_add(static_cast<std::uint64_t>(sent),
-                                                       std::memory_order_relaxed);
+            increment(metrics_.backend_to_client_bytes, static_cast<std::uint64_t>(sent));
             refresh(flow, now);
         }
     }
@@ -500,8 +497,8 @@ private:
     std::vector<std::size_t> free_slots_;
     std::map<FlowKey, std::size_t> flow_index_;
     IdleOrder idle_order_;
-    Sources sources_;
-    std::set<std::pair<std::size_t, IpAddress>> sources_by_size_;
+    FlowsByNetwork flows_by_network_;
+    std::set<std::pair<std::size_t, IpAddress>> networks_by_flow_count_;
     Clock::duration client_silence_limit_;
     std::array<std::uint8_t, kMaxPacketBytes> packet_{};
 };

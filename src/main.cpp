@@ -28,16 +28,16 @@
 namespace erikslund::mmproxy {
 namespace {
 
-FileDescriptor termination_signals() {
+FileDescriptor block_termination_signals() {
     sigset_t signals;
     ::sigemptyset(&signals);
     ::sigaddset(&signals, SIGINT);
     ::sigaddset(&signals, SIGTERM);
     if (::sigprocmask(SIG_BLOCK, &signals, nullptr) != 0)
-        throw_socket_error("block termination signals");
+        throw_system_error("block termination signals");
     FileDescriptor receiver(::signalfd(-1, &signals, SFD_CLOEXEC));
     if (!receiver)
-        throw_socket_error("open termination signal descriptor");
+        throw_system_error("open termination signal descriptor");
     return receiver;
 }
 
@@ -46,7 +46,7 @@ void ignore_broken_pipes() {
     ignore.sa_handler = SIG_IGN;
     ::sigemptyset(&ignore.sa_mask);
     if (::sigaction(SIGPIPE, &ignore, nullptr) != 0)
-        throw_socket_error("ignore SIGPIPE");
+        throw_system_error("ignore SIGPIPE");
 }
 
 void raise_open_file_limit() {
@@ -68,7 +68,7 @@ struct Problems {
     std::uint64_t share_refused = 0;
     std::uint64_t flows_evicted = 0;
     std::uint64_t udp_dropped = 0;
-    std::array<std::uint64_t, kUpstreamFailureCount> upstream_errors{};
+    std::array<std::uint64_t, kBackendFailureCount> backend_failures{};
 };
 
 Problems count_problems(const std::vector<Metrics>& metrics) {
@@ -84,8 +84,8 @@ Problems count_problems(const std::vector<Metrics>& metrics) {
         total.share_refused += shard.share_refused.load(kRelaxed);
         total.flows_evicted += shard.flows_evicted.load(kRelaxed);
         total.udp_dropped += shard.udp_dropped.load(kRelaxed);
-        for (std::size_t reason = 0; reason < kUpstreamFailureCount; ++reason)
-            total.upstream_errors[reason] += shard.upstream_errors[reason].load(kRelaxed);
+        for (std::size_t reason = 0; reason < kBackendFailureCount; ++reason)
+            total.backend_failures[reason] += shard.backend_failures[reason].load(kRelaxed);
     }
     return total;
 }
@@ -104,19 +104,19 @@ std::string describe_changes(const Problems& current, const Problems& before) {
     add(current.share_refused - before.share_refused, "refused over a client's share");
     add(current.flows_evicted - before.flows_evicted, "UDP flows evicted");
     add(current.udp_dropped - before.udp_dropped, "UDP datagrams dropped");
-    // In UpstreamFailure order.
-    constexpr std::array<std::string_view, kUpstreamFailureCount> kUpstreamFailures{
+    // In BackendFailure order.
+    constexpr std::array<std::string_view, kBackendFailureCount> kBackendFailureLabels{
         "clients without a backend for their family", "backend socket setup failures",
         "claimed-address bind failures", "backend connect failures", "backend connect timeouts",
         "backend failures mid-relay"};
-    for (std::size_t reason = 0; reason < kUpstreamFailureCount; ++reason)
-        add(current.upstream_errors[reason] - before.upstream_errors[reason],
-            kUpstreamFailures[reason]);
+    for (std::size_t reason = 0; reason < kBackendFailureCount; ++reason)
+        add(current.backend_failures[reason] - before.backend_failures[reason],
+            kBackendFailureLabels[reason]);
     return text;
 }
 
 template <typename Function>
-void guard_worker(const FileDescriptor& failure, Function run) noexcept {
+void guard_worker(const FileDescriptor& failure_event, Function run) noexcept {
     try {
         run();
         return;
@@ -128,42 +128,29 @@ void guard_worker(const FileDescriptor& failure, Function run) noexcept {
     constexpr std::uint64_t kFailure = 1;
     ssize_t written;
     do {
-        written = ::write(failure.get(), &kFailure, sizeof(kFailure));
+        written = ::write(failure_event.get(), &kFailure, sizeof(kFailure));
     } while (written < 0 && errno == EINTR);
 }
 
-int supervise(const Config& config) {
-    if (config.workers == 0)
-        throw ConfigError("at least one worker is required");
-    ignore_broken_pipes();
-    const auto signals = termination_signals();
-    const FileDescriptor failure(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-    if (!failure)
-        throw_socket_error("open worker failure descriptor");
-    check_upstream_permissions(config);
-
-    const int socket_type = config.transport == Transport::Tcp ? SOCK_STREAM : SOCK_DGRAM;
+std::vector<FileDescriptor> make_listeners(const Config& config) {
     std::vector<FileDescriptor> listeners;
     listeners.reserve(config.workers);
     for (std::size_t index = 0; index < config.workers; ++index)
-        listeners.push_back(make_listener(config, socket_type));
+        listeners.push_back(make_listener(config));
+    return listeners;
+}
 
-    std::vector<Metrics> metrics(config.workers);
-    Balancer balancer(config.workers);
-    FairShare fair_share(config.max_connections);
-    const auto memory_limit =
-        config.transport == Transport::Tcp ? find_memory_limit() : std::nullopt;
-    const auto memory = memory_limit ? MemoryGuard(*memory_limit) : MemoryGuard();
-    const TcpShared tcp_shared{.balancer = balancer, .fair_share = fair_share, .memory = memory};
+std::vector<std::jthread> start_workers(const Config& config,
+                                        std::vector<FileDescriptor> listeners,
+                                        std::vector<Metrics>& metrics, const TcpShared& tcp_shared,
+                                        const FileDescriptor& failure_event) {
     std::vector<std::jthread> threads;
     threads.reserve(config.workers);
-    const auto slots_per_worker = config.max_connections / config.workers;
-    const auto extra_slots = config.max_connections % config.workers;
     for (std::size_t index = 0; index < config.workers; ++index) {
-        const auto limit = slots_per_worker + (index < extra_slots ? 1U : 0U);
-        auto worker = [&, index, limit, listener = std::move(listeners[index])]
-                      (std::stop_token stop) mutable {
-            guard_worker(failure, [&] {
+        const auto limit = worker_share(config.max_connections, config.workers, index);
+        auto worker = [&config, &metrics, &tcp_shared, &failure_event, index, limit,
+                       listener = std::move(listeners[index])](std::stop_token stop) mutable {
+            guard_worker(failure_event, [&] {
                 if (config.transport == Transport::Tcp)
                     run_tcp(stop, config, std::move(listener), limit, metrics[index], tcp_shared,
                             index);
@@ -173,40 +160,76 @@ int supervise(const Config& config) {
         };
         threads.emplace_back(std::move(worker));
     }
+    return threads;
+}
 
+void announce_ready(const Config& config, const MemoryGuard& memory_guard,
+                    const std::optional<MemoryLimit>& memory_limit) {
     const auto startup = std::format("mmproxy {} ready ({} workers, {} connections or flows)\n",
                                      MMPROXY_VERSION, config.workers, config.max_connections);
     std::fputs(startup.c_str(), stderr);
-    if (memory.enabled()) {
-        constexpr std::uint64_t kBytesPerMebibyte = 1 << 20;
-        const auto guard = std::format(
-            "mmproxy closes the connections holding the most bytes above {} MiB of memory use\n",
-            memory.threshold_bytes() / kBytesPerMebibyte);
-        std::fputs(guard.c_str(), stderr);
-        if (memory_limit && memory_limit->shared)
-            std::fputs("mmproxy: the memory limit belongs to a parent cgroup, so other processes' "
-                       "memory can also trigger shedding\n",
-                       stderr);
-    }
-    pollfd descriptors[] = {{signals.get(), POLLIN, 0}, {failure.get(), POLLIN, 0}};
+    if (!memory_guard.enabled())
+        return;
+    constexpr std::uint64_t kBytesPerMebibyte = 1 << 20;
+    const auto guard = std::format(
+        "mmproxy closes the connections holding the most bytes above {} MiB of memory use\n",
+        memory_guard.threshold_bytes() / kBytesPerMebibyte);
+    std::fputs(guard.c_str(), stderr);
+    if (memory_limit && memory_limit->from_parent_cgroup)
+        std::fputs("mmproxy: the memory limit belongs to a parent cgroup, so other processes' "
+                   "memory can also trigger shedding\n",
+                   stderr);
+}
+
+enum class Shutdown { Requested, WorkerFailed };
+
+Shutdown wait_for_shutdown(const FileDescriptor& signals, const FileDescriptor& failure_event,
+                           const std::vector<Metrics>& metrics) {
+    pollfd descriptors[] = {{signals.get(), POLLIN, 0}, {failure_event.get(), POLLIN, 0}};
+    const pollfd& worker_failure = descriptors[1];
     auto reported = count_problems(metrics);
-    int ready;
     for (;;) {
-        ready = ::poll(descriptors, std::size(descriptors), kReportIntervalMs);
+        const int ready = ::poll(descriptors, std::size(descriptors), kReportIntervalMs);
         if (ready < 0 && errno == EINTR)
             continue;
-        if (ready != 0)
-            break;
+        if (ready < 0)
+            throw_system_error("wait for shutdown");
+        if (ready > 0)
+            return worker_failure.revents != 0 ? Shutdown::WorkerFailed : Shutdown::Requested;
         const auto current = count_problems(metrics);
         if (const auto changes = describe_changes(current, reported); !changes.empty())
             std::fputs(std::format("mmproxy in the last minute: {}\n", changes).c_str(), stderr);
         reported = current;
     }
-    if (ready < 0)
-        throw_socket_error("wait for shutdown");
+}
+
+int supervise(const Config& config) {
+    if (config.workers == 0)
+        throw ConfigError("at least one worker is required");
+    ignore_broken_pipes();
+    const auto signals = block_termination_signals();
+    const FileDescriptor failure_event(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!failure_event)
+        throw_system_error("open worker failure descriptor");
+    check_backend_permissions(config);
+    auto listeners = make_listeners(config);
+
+    std::vector<Metrics> metrics(config.workers);
+    Balancer balancer(config.workers);
+    FairShare fair_share(config.max_connections);
+    const auto memory_limit =
+        config.transport == Transport::Tcp ? find_memory_limit() : std::nullopt;
+    const auto memory_guard = memory_limit ? MemoryGuard(*memory_limit) : MemoryGuard();
+    const TcpShared tcp_shared{
+        .balancer = balancer, .fair_share = fair_share, .memory_guard = memory_guard};
+    auto threads =
+        start_workers(config, std::move(listeners), metrics, tcp_shared, failure_event);
+
+    announce_ready(config, memory_guard, memory_limit);
+    const auto shutdown = wait_for_shutdown(signals, failure_event, metrics);
     for (auto& thread : threads)
         thread.request_stop();
-    return descriptors[1].revents != 0 ? 1 : 0;
+    return shutdown == Shutdown::WorkerFailed ? 1 : 0;
 }
 
 } // namespace

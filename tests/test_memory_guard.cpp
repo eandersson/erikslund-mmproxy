@@ -39,17 +39,17 @@ TEST_CASE("A cgroup memory.max reads as bytes, and max means no limit") {
 }
 
 TEST_CASE("memory.stat yields its page-cache line") {
-    CHECK(parse_file_pages("anon 4096\nfile 8192\nkernel 1\n") == 8192);
-    CHECK(parse_file_pages("file 5\n") == 5);
-    CHECK_FALSE(parse_file_pages("anon 1\nfile_mapped 2\n").has_value());
-    CHECK_FALSE(parse_file_pages("").has_value());
+    CHECK(parse_file_cache_bytes("anon 4096\nfile 8192\nkernel 1\n") == 8192);
+    CHECK(parse_file_cache_bytes("file 5\n") == 5);
+    CHECK_FALSE(parse_file_cache_bytes("anon 1\nfile_mapped 2\n").has_value());
+    CHECK_FALSE(parse_file_cache_bytes("").has_value());
 }
 
 TEST_CASE("The memory guard reports pressure from 80% of the limit") {
     const CgroupFile usage("memory.current", "0\n");
     const CgroupFile stat("memory.stat", "anon 0\nfile 0\n");
     const MemoryGuard guard(
-        MemoryLimit{.bytes = kLimitBytes, .usage = usage.path(), .stat = stat.path()});
+        MemoryLimit{.bytes = kLimitBytes, .usage_path = usage.path(), .stat_path = stat.path()});
     REQUIRE(guard.enabled());
     CHECK(guard.threshold_bytes() == 800);
     CHECK_FALSE(guard.under_pressure());
@@ -63,7 +63,7 @@ TEST_CASE("Page cache the kernel can reclaim does not count as pressure") {
     const CgroupFile usage("memory.current", "900\n");
     const CgroupFile stat("memory.stat", "anon 100\nfile 200\n");
     const MemoryGuard guard(
-        MemoryLimit{.bytes = kLimitBytes, .usage = usage.path(), .stat = stat.path()});
+        MemoryLimit{.bytes = kLimitBytes, .usage_path = usage.path(), .stat_path = stat.path()});
     CHECK_FALSE(guard.under_pressure());
     stat.write("anon 800\nfile 50\n");
     CHECK(guard.under_pressure());
@@ -74,9 +74,9 @@ TEST_CASE("Without a usable cgroup limit the memory guard stays off") {
     CHECK_FALSE(off.enabled());
     CHECK_FALSE(off.under_pressure());
     const MemoryGuard missing(MemoryLimit{.bytes = kLimitBytes,
-                                          .usage = "/nonexistent/memory.current",
-                                          .stat = "/nonexistent/memory.stat",
-                                          .shared = false});
+                                          .usage_path = "/nonexistent/memory.current",
+                                          .stat_path = "/nonexistent/memory.stat",
+                                          .from_parent_cgroup = false});
     CHECK_FALSE(missing.enabled());
     CHECK_FALSE(missing.under_pressure());
 }

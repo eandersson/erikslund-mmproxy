@@ -1,5 +1,5 @@
 #pragma once
-// Keep one client source from taking every TCP connection slot once the proxy is nearly full.
+// Keep one client network from taking every TCP connection slot once the proxy is nearly full.
 
 #include <cstddef>
 #include <map>

@@ -18,12 +18,18 @@ namespace {
 constexpr std::string_view kRelay = "192.0.2.25/32";
 constexpr std::string_view kBackend = "127.0.0.1:3333";
 
-Config parse(std::initializer_list<std::string_view> arguments) {
+Config parse(const std::vector<std::string_view>& arguments) {
     std::vector<std::string> storage(arguments.begin(), arguments.end());
     std::vector<char*> pointers;
     for (auto& argument : storage)
         pointers.push_back(argument.data());
     return parse_config(pointers);
+}
+
+Config parse_with_required(std::initializer_list<std::string_view> options) {
+    std::vector<std::string_view> arguments{"--allow", kRelay, "--backend-v4", kBackend};
+    arguments.insert(arguments.end(), options);
+    return parse(arguments);
 }
 
 // Write a temporary allowlist and delete it when the test ends.
@@ -80,20 +86,25 @@ TEST_CASE("Each backend option accepts only its own address family") {
 }
 
 TEST_CASE("The listener may not overlap a backend, even as a wildcard") {
-    CHECK_THROWS_WITH_AS(parse({"--allow", kRelay, "--backend-v4", kBackend, "--listen", kBackend}),
+    CHECK_THROWS_WITH_AS(parse_with_required({"--listen", kBackend}),
                          doctest::Contains("overlaps a backend"), ConfigError);
-    CHECK_THROWS_WITH_AS(
-        parse({"--allow", kRelay, "--backend-v4", kBackend, "--listen", "0.0.0.0:3333"}),
-        doctest::Contains("overlaps a backend"), ConfigError);
+    CHECK_THROWS_WITH_AS(parse_with_required({"--listen", "0.0.0.0:3333"}),
+                         doctest::Contains("overlaps a backend"), ConfigError);
 }
 
 TEST_CASE("-listeners above the worker maximum runs the most workers, --workers refuses it") {
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend, "-p", "udp", "-listeners", "1000"})
-              .workers == 64);
-    CHECK_THROWS_WITH_AS(parse({"--allow", kRelay, "--backend-v4", kBackend, "--workers", "65"}),
+    CHECK(parse_with_required({"-p", "udp", "-listeners", "1000"}).workers == 64);
+    CHECK_THROWS_WITH_AS(parse_with_required({"--workers", "65"}),
                          doctest::Contains("from 1 to 64"), ConfigError);
-    CHECK_THROWS_AS(parse({"--allow", kRelay, "--backend-v4", kBackend, "-listeners", "0"}),
-                    ConfigError);
+    CHECK_THROWS_AS(parse_with_required({"-listeners", "0"}), ConfigError);
+}
+
+TEST_CASE("Workers split a total so their shares differ by at most one") {
+    CHECK(worker_share(10, 4, 0) == 3);
+    CHECK(worker_share(10, 4, 1) == 3);
+    CHECK(worker_share(10, 4, 2) == 2);
+    CHECK(worker_share(10, 4, 3) == 2);
+    CHECK(worker_share(8, 4, 3) == 2);
 }
 
 TEST_CASE("Options accept --name=value") {
@@ -105,17 +116,13 @@ TEST_CASE("Options accept --name=value") {
 }
 
 TEST_CASE("The relay user timeout is off unless --user-timeout-ms sets it") {
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend}).user_timeout ==
+    CHECK(parse_with_required({}).user_timeout == std::chrono::milliseconds::zero());
+    CHECK(parse_with_required({"--user-timeout-ms", "0"}).user_timeout ==
           std::chrono::milliseconds::zero());
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend, "--user-timeout-ms", "0"})
-              .user_timeout == std::chrono::milliseconds::zero());
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend, "--user-timeout-ms=120000"})
-              .user_timeout == std::chrono::minutes(2));
-    for (const auto value : {"-1", "86400001", "1.5"}) {
-        CHECK_THROWS_AS(
-            parse({"--allow", kRelay, "--backend-v4", kBackend, "--user-timeout-ms", value}),
-            ConfigError);
-    }
+    CHECK(parse_with_required({"--user-timeout-ms=120000"}).user_timeout ==
+          std::chrono::minutes(2));
+    for (const auto value : {"-1", "86400001", "1.5"})
+        CHECK_THROWS_AS(parse_with_required({"--user-timeout-ms", value}), ConfigError);
 }
 
 TEST_CASE("Allowlist files accept comments, blank lines, spaces and CRLF") {
@@ -169,8 +176,8 @@ TEST_CASE("A wildcard listener still refuses a loopback allowlist") {
 
 TEST_CASE("Flags reject a value instead of calling themselves unknown") {
     for (const auto flag : {"--allow-local-relays=true", "--allow-any-relay=1"}) {
-        CHECK_THROWS_WITH_AS(parse({"--allow", kRelay, "--backend-v4", kBackend, flag}),
-                             doctest::Contains("takes no value"), ConfigError);
+        CHECK_THROWS_WITH_AS(parse_with_required({flag}), doctest::Contains("takes no value"),
+                             ConfigError);
     }
 }
 
@@ -187,15 +194,10 @@ TEST_CASE("Relay entries with host bits set are refused with a hint") {
 }
 
 TEST_CASE("The PROXY header limit stays between the v1 maximum and 64 KiB") {
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend}).max_header_bytes == 4096);
-    CHECK(parse({"--allow", kRelay, "--backend-v4", kBackend, "--max-header-bytes", "107"})
-              .max_header_bytes == 107);
-    CHECK_THROWS_AS(
-        parse({"--allow", kRelay, "--backend-v4", kBackend, "--max-header-bytes", "106"}),
-        ConfigError);
-    CHECK_THROWS_AS(
-        parse({"--allow", kRelay, "--backend-v4", kBackend, "--max-header-bytes", "65552"}),
-        ConfigError);
+    CHECK(parse_with_required({}).max_header_bytes == 4096);
+    CHECK(parse_with_required({"--max-header-bytes", "107"}).max_header_bytes == 107);
+    CHECK_THROWS_AS(parse_with_required({"--max-header-bytes", "106"}), ConfigError);
+    CHECK_THROWS_AS(parse_with_required({"--max-header-bytes", "65552"}), ConfigError);
 }
 
 TEST_CASE("Allowlist errors name the file and line") {
@@ -206,21 +208,21 @@ TEST_CASE("Allowlist errors name the file and line") {
 
 TEST_CASE("The descriptor limit caps TCP tunnels at six descriptors each") {
     const DescriptorLimit limit(1000);
-    const auto config = parse({"--allow", kRelay, "--backend-v4", kBackend, "--workers", "1"});
+    const auto config = parse_with_required({"--workers", "1"});
     // 64 reserved plus 19 for the worker (listener, epoll, eventfd, 8 cached pipes) leaves 917
     // for tunnels.
     CHECK(config.max_connections == 152);
 }
 
 TEST_CASE("Workers split one grown-pipe budget instead of each taking their own") {
-    const auto one_worker = parse({"--allow", kRelay, "--backend-v4", kBackend, "--workers", "1"});
-    const auto two_workers = parse({"--allow", kRelay, "--backend-v4", kBackend, "--workers", "2"});
+    const auto one_worker = parse_with_required({"--workers", "1"});
+    const auto two_workers = parse_with_required({"--workers", "2"});
     // The budget is half the per-user pipe pages, whatever the worker count.
-    CHECK(two_workers.streaming_pipes == one_worker.streaming_pipes);
+    CHECK(two_workers.streaming_pipe_budget == one_worker.streaming_pipe_budget);
 }
 
 TEST_CASE("Default TCP workers stay between one and eight") {
-    const auto config = parse({"--allow", kRelay, "--backend-v4", kBackend});
+    const auto config = parse_with_required({});
     CHECK(config.workers >= 1);
     CHECK(config.workers <= 8);
 }

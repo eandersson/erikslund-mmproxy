@@ -8,13 +8,10 @@
 
 #include "mmproxy/address.hpp"
 #include "mmproxy/proxy_protocol.hpp"
+#include "test_bytes.hpp"
 
 namespace erikslund::mmproxy {
 namespace {
-
-std::span<const std::uint8_t> bytes(std::string_view text) {
-    return {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()};
-}
 
 constexpr std::array<std::uint8_t, 34> kDatagramWithTlvAndPayload{
     0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,

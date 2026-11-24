@@ -13,7 +13,7 @@ namespace erikslund::mmproxy {
 
 struct Handoff {
     FileDescriptor client;
-    Endpoint peer;
+    Endpoint relay;
 };
 
 class Balancer {
@@ -22,10 +22,10 @@ public:
 
     [[nodiscard]] std::size_t choose(std::size_t accepting_worker) const noexcept;
     void hand_off(std::size_t worker, Handoff handoff);
-    [[nodiscard]] std::vector<Handoff> take(std::size_t worker);
+    [[nodiscard]] std::vector<Handoff> take_handoffs(std::size_t worker);
     void opened(std::size_t worker) noexcept;
     void closed(std::size_t worker) noexcept;
-    [[nodiscard]] int wakeup(std::size_t worker) const noexcept;
+    [[nodiscard]] int inbox_descriptor(std::size_t worker) const noexcept;
 
 private:
     struct alignas(64) Slot {

@@ -37,15 +37,17 @@ struct Config {
     std::chrono::milliseconds idle_timeout{300'000}; // 0 disables the TCP idle deadline.
     std::chrono::milliseconds udp_timeout{60'000};
     std::chrono::milliseconds user_timeout{0}; // 0 keeps the kernel's retransmission limit.
-    int mark = 0;
+    int backend_mark = 0;
     std::size_t max_header_bytes = 4096;
     bool allow_local_relays = false;
     bool allow_any_relay = false;
-    std::size_t streaming_pipes = 1;
+    std::size_t streaming_pipe_budget = 1;
 };
 
 [[nodiscard]] Config parse_config(std::span<char*> arguments);
 [[nodiscard]] const std::optional<Endpoint>& backend_for(const Config& config, int family);
+[[nodiscard]] std::size_t worker_share(std::size_t total, std::size_t workers,
+                                       std::size_t worker_index) noexcept;
 [[nodiscard]] std::string_view usage();
 
 } // namespace erikslund::mmproxy

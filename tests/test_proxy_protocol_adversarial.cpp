@@ -11,6 +11,7 @@
 
 #include "mmproxy/address.hpp"
 #include "mmproxy/proxy_protocol.hpp"
+#include "test_bytes.hpp"
 
 namespace erikslund::mmproxy {
 namespace {
@@ -34,10 +35,6 @@ constexpr std::array<std::uint8_t, 34> kStreamHeaderWithPayload{
 };
 constexpr std::size_t kStreamHeaderBytes = kStreamHeaderWithPayload.size() - 1;
 constexpr std::string_view kV1Header = "PROXY TCP4 192.0.2.20 198.51.100.5 12345 443\r\n";
-
-std::span<const std::uint8_t> bytes(std::string_view text) {
-    return {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()};
-}
 
 std::vector<std::uint8_t> with_byte(std::span<const std::uint8_t> original, std::size_t offset,
                                     std::uint8_t value) {

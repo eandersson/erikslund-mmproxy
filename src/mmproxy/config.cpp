@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -21,15 +20,17 @@
 #include <unistd.h>
 
 #include "mmproxy/cgroup.hpp"
+#include "mmproxy/number.hpp"
 #include "mmproxy/proxy_protocol.hpp"
 
 namespace erikslund::mmproxy {
 namespace {
 
 constexpr int kMaxWorkers = 64;
-constexpr unsigned kDefaultWorkerLimit = 8;
+constexpr unsigned kMaxDefaultWorkers = 8;
 constexpr int kMaxConnections = 65'536;
 constexpr int kMaxTimeoutMs = 86'400'000;
+constexpr int kMinHeaderBytesLimit = static_cast<int>(kMaxProxyV1HeaderSize);
 constexpr int kMaxHeaderBytesLimit = static_cast<int>(kMaxProxyHeaderSize);
 constexpr int kSecondsToMilliseconds = 1000;
 constexpr rlim_t kReservedDescriptors = 64;
@@ -41,23 +42,44 @@ constexpr std::size_t kFallbackPageBytes = 4096;
 constexpr std::size_t kStreamingBudgetDivisor = 2;
 
 int read_integer(std::string_view value, std::string_view option, int minimum, int maximum) {
-    int result = 0;
-    const auto [end, error] = std::from_chars(value.begin(), value.end(), result);
-    if (error != std::errc{} || end != value.end() || result < minimum || result > maximum)
-        throw ConfigError(std::format("{} expects an integer from {} to {}", option, minimum, maximum));
-    return result;
+    const auto number = parse_number<int>(value);
+    if (!number || *number < minimum || *number > maximum)
+        throw ConfigError(
+            std::format("{} expects an integer from {} to {}", option, minimum, maximum));
+    return *number;
 }
 
-Endpoint read_endpoint(std::string_view value, std::string_view option, int family = AF_UNSPEC,
-                       bool loopback_only = false) {
+std::size_t read_size(std::string_view value, std::string_view option, int minimum, int maximum) {
+    return static_cast<std::size_t>(read_integer(value, option, minimum, maximum));
+}
+
+std::chrono::milliseconds read_timeout(std::string_view value, std::string_view option,
+                                       int minimum) {
+    return std::chrono::milliseconds(read_integer(value, option, minimum, kMaxTimeoutMs));
+}
+
+Transport read_transport(std::string_view value) {
+    if (value == "tcp")
+        return Transport::Tcp;
+    if (value == "udp")
+        return Transport::Udp;
+    throw ConfigError("--protocol expects tcp or udp");
+}
+
+Endpoint read_endpoint(std::string_view value, std::string_view option) {
     const auto endpoint = parse_endpoint(value);
     if (!endpoint || endpoint->port == 0)
         throw ConfigError(std::format("{} expects a numeric IP and nonzero port", option));
-    if (family != AF_UNSPEC && endpoint->address.family != family)
-        throw ConfigError(std::format("{} expects an address of the configured IP family", option));
-    if (loopback_only && !endpoint->address.is_loopback())
-        throw ConfigError(std::format("{} requires a loopback address", option));
     return *endpoint;
+}
+
+Endpoint read_backend(std::string_view value, std::string_view option, int family) {
+    const auto endpoint = read_endpoint(value, option);
+    if (endpoint.address.family != family)
+        throw ConfigError(std::format("{} expects an address of the configured IP family", option));
+    if (!endpoint.address.is_loopback())
+        throw ConfigError(std::format("{} requires a loopback address", option));
+    return endpoint;
 }
 
 constexpr std::string_view kTrustEntryHint =
@@ -89,26 +111,24 @@ void read_trusted_file(TrustList& trusted, std::string_view path) {
         throw ConfigError(std::format("could not read relay allowlist '{}'", path));
 }
 
-std::optional<unsigned int> read_cpu_quota(const std::filesystem::path& path) {
+std::optional<unsigned int> read_cpu_limit(const std::filesystem::path& path) {
     std::ifstream file(path);
     std::string quota_text;
     std::uint64_t period = 0;
     if (!(file >> quota_text >> period) || quota_text == "max" || period == 0)
         return std::nullopt;
-    std::uint64_t quota = 0;
-    const char* const end = quota_text.data() + quota_text.size();
-    const auto [next, error] = std::from_chars(quota_text.data(), end, quota);
-    if (error != std::errc{} || next != end)
+    const auto quota = parse_number<std::uint64_t>(quota_text);
+    if (!quota)
         return std::nullopt;
-    return static_cast<unsigned int>(std::max<std::uint64_t>(1, (quota + period - 1) / period));
+    return static_cast<unsigned int>(std::max<std::uint64_t>(1, (*quota + period - 1) / period));
 }
 
-std::optional<unsigned int> cgroup_cpu_quota() {
+std::optional<unsigned int> cgroup_cpu_limit() {
     std::optional<unsigned int> tightest;
     for (const auto& directory : cgroup_directories()) {
-        const auto quota = read_cpu_quota(directory / "cpu.max");
-        if (quota && (!tightest || *quota < *tightest))
-            tightest = quota;
+        const auto limit = read_cpu_limit(directory / "cpu.max");
+        if (limit && (!tightest || *limit < *tightest))
+            tightest = limit;
     }
     return tightest;
 }
@@ -119,12 +139,12 @@ unsigned int usable_cpu_count() {
     CPU_ZERO(&allowed);
     if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
         cpus = static_cast<unsigned int>(CPU_COUNT(&allowed));
-    if (const auto quota = cgroup_cpu_quota())
-        cpus = std::min(cpus, *quota);
+    if (const auto limit = cgroup_cpu_limit())
+        cpus = std::min(cpus, *limit);
     return std::max(cpus, 1U);
 }
 
-std::size_t streaming_pipe_budget() {
+std::size_t read_streaming_pipe_budget() {
     std::size_t budget_pages = kDefaultPipeUserPagesSoft;
     if (std::ifstream file{std::string(kPipeUserPagesSoftPath)}; file) {
         std::size_t configured = 0;
@@ -138,14 +158,10 @@ std::size_t streaming_pipe_budget() {
     return budget_pages * page_bytes / kStreamingBudgetDivisor / kStreamingPipeBytes;
 }
 
-bool is_wildcard(const IpAddress& address) {
-    return std::ranges::all_of(address.bytes, [](auto byte) { return byte == 0; });
-}
-
-bool listeners_overlap(const Endpoint& left, const Endpoint& right) {
-    if (left.address.family != right.address.family || left.port != right.port)
+bool listener_overlaps(const Endpoint& listener, const Endpoint& backend) {
+    if (listener.address.family != backend.address.family || listener.port != backend.port)
         return false;
-    return left.address == right.address || is_wildcard(left.address);
+    return listener.address == backend.address || listener.address.is_wildcard();
 }
 
 std::vector<IpAddress> host_addresses() {
@@ -171,25 +187,25 @@ std::vector<IpAddress> host_addresses() {
 
 bool trusts_this_host(const Config& config) {
     constexpr unsigned int kIpv4LoopbackBits = 8;
-    constexpr unsigned int kHostBits = 128;
-    constexpr bool kCountEveryone = false;
+    constexpr unsigned int kSingleHostPrefixBits = 128;
     const auto covers = [&config](const IpAddress& address, unsigned int bits) {
-        return config.trusted.overlaps(address, bits, kCountEveryone);
+        return config.trusted.overlaps(address, bits, TrustList::Everyone::Ignore);
     };
     if (covers(parse_ip_address("127.0.0.0").value(), kIpv4LoopbackBits) ||
-        covers(parse_ip_address("::1").value(), kHostBits))
+        covers(parse_ip_address("::1").value(), kSingleHostPrefixBits))
         return true;
-    if (!is_wildcard(config.listen.address) && covers(config.listen.address, kHostBits))
+    const auto& listen = config.listen.address;
+    if (!listen.is_wildcard() && covers(listen, kSingleHostPrefixBits))
         return true;
     return std::ranges::any_of(host_addresses(), [&covers](const IpAddress& address) {
-        return covers(address, kHostBits);
+        return covers(address, kSingleHostPrefixBits);
     });
 }
 
 bool trusts_link_local(const TrustList& trusted) {
     constexpr unsigned int kLinkLocalBits = 10;
-    constexpr bool kCountEveryone = false;
-    return trusted.overlaps(parse_ip_address("fe80::").value(), kLinkLocalBits, kCountEveryone);
+    return trusted.overlaps(parse_ip_address("fe80::").value(), kLinkLocalBits,
+                            TrustList::Everyone::Ignore);
 }
 
 void validate(const Config& config) {
@@ -198,7 +214,7 @@ void validate(const Config& config) {
     if (!config.backend_ipv4 && !config.backend_ipv6)
         throw ConfigError("configure a loopback backend with --backend-v4 or --backend-v6");
     for (const auto* backend : {&config.backend_ipv4, &config.backend_ipv6}) {
-        if (*backend && listeners_overlap(config.listen, **backend))
+        if (*backend && listener_overlaps(config.listen, **backend))
             throw ConfigError("the proxy listener overlaps a backend address");
     }
     if (config.trusted.trusts_everyone() && !config.allow_any_relay)
@@ -237,42 +253,40 @@ void apply_option(Config& config, std::string_view option, std::string_view valu
     if (option == "--listen" || option == "-l")
         config.listen = read_endpoint(value, option);
     else if (option == "--backend-v4" || option == "-4")
-        config.backend_ipv4 = read_endpoint(value, option, AF_INET, true);
+        config.backend_ipv4 = read_backend(value, option, AF_INET);
     else if (option == "--backend-v6" || option == "-6")
-        config.backend_ipv6 = read_endpoint(value, option, AF_INET6, true);
+        config.backend_ipv6 = read_backend(value, option, AF_INET6);
     else if (option == "--allow")
         add_trusted(config.trusted, value);
     else if (option == "--allowed-subnets" || option == "-allowed-subnets")
         read_trusted_file(config.trusted, value);
-    else if (option == "--protocol" || option == "-p") {
-        if (value != "tcp" && value != "udp")
-            throw ConfigError("--protocol expects tcp or udp");
-        config.transport = value == "tcp" ? Transport::Tcp : Transport::Udp;
-    } else if (option == "--workers")
-        config.workers = static_cast<std::size_t>(read_integer(value, option, 1, kMaxWorkers));
+    else if (option == "--protocol" || option == "-p")
+        config.transport = read_transport(value);
+    else if (option == "--workers")
+        config.workers = read_size(value, option, 1, kMaxWorkers);
     else if (option == "-listeners")
-        config.workers = static_cast<std::size_t>(std::min(
-            read_integer(value, option, 1, std::numeric_limits<int>::max()), kMaxWorkers));
+        config.workers = std::min<std::size_t>(
+            read_size(value, option, 1, std::numeric_limits<int>::max()), kMaxWorkers);
     else if (option == "--max-connections")
-        config.max_connections = static_cast<std::size_t>(read_integer(value, option, 1, kMaxConnections));
+        config.max_connections = read_size(value, option, 1, kMaxConnections);
     else if (option == "--header-timeout-ms")
-        config.header_timeout = std::chrono::milliseconds(read_integer(value, option, 1, kMaxTimeoutMs));
+        config.header_timeout = read_timeout(value, option, 1);
     else if (option == "--connect-timeout-ms")
-        config.connect_timeout = std::chrono::milliseconds(read_integer(value, option, 1, kMaxTimeoutMs));
+        config.connect_timeout = read_timeout(value, option, 1);
     else if (option == "--idle-timeout-ms")
-        config.idle_timeout = std::chrono::milliseconds(read_integer(value, option, 0, kMaxTimeoutMs));
+        config.idle_timeout = read_timeout(value, option, 0);
     else if (option == "--udp-timeout-ms")
-        config.udp_timeout = std::chrono::milliseconds(read_integer(value, option, 1, kMaxTimeoutMs));
+        config.udp_timeout = read_timeout(value, option, 1);
     else if (option == "--user-timeout-ms")
-        config.user_timeout = std::chrono::milliseconds(read_integer(value, option, 0, kMaxTimeoutMs));
-    else if (option == "-close-after") {
-        const int seconds = read_integer(value, option, 1, kMaxTimeoutMs / kSecondsToMilliseconds);
-        config.udp_timeout = std::chrono::seconds(seconds);
-    } else if (option == "--mark" || option == "-mark")
-        config.mark = read_integer(value, option, 0, std::numeric_limits<int>::max());
+        config.user_timeout = read_timeout(value, option, 0);
+    else if (option == "-close-after")
+        config.udp_timeout = std::chrono::seconds(
+            read_integer(value, option, 1, kMaxTimeoutMs / kSecondsToMilliseconds));
+    else if (option == "--mark" || option == "-mark")
+        config.backend_mark = read_integer(value, option, 0, std::numeric_limits<int>::max());
     else if (option == "--max-header-bytes")
-        config.max_header_bytes = static_cast<std::size_t>(read_integer(
-            value, option, static_cast<int>(kMaxProxyV1HeaderSize), kMaxHeaderBytesLimit));
+        config.max_header_bytes =
+            read_size(value, option, kMinHeaderBytesLimit, kMaxHeaderBytesLimit);
     else
         throw ConfigError(std::format("unknown option '{}'", option));
 }
@@ -299,7 +313,7 @@ Config parse_config(std::span<char*> arguments) {
     constexpr std::string_view kDefaultListen = "127.0.0.1:8443";
     Config config;
     config.listen = read_endpoint(kDefaultListen, "--listen");
-    bool worker_override = false;
+    bool workers_given = false;
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const auto argument = std::string_view(arguments[index]);
         if (apply_flag(config, argument))
@@ -308,7 +322,7 @@ Config parse_config(std::span<char*> arguments) {
         const auto option = go_spelling(argument.substr(0, separator));
         if (option == kAllowLocalRelays || option == kAllowAnyRelay)
             throw ConfigError(std::format("{} takes no value", option));
-        worker_override |= option == "--workers" || option == "-listeners";
+        workers_given |= option == "--workers" || option == "-listeners";
         if (separator != std::string_view::npos) {
             apply_option(config, option, argument.substr(separator + 1));
         } else {
@@ -318,20 +332,25 @@ Config parse_config(std::span<char*> arguments) {
         }
     }
     validate(config);
-    if (!worker_override && config.transport == Transport::Tcp)
-        config.workers = std::clamp(usable_cpu_count(), 1U, kDefaultWorkerLimit);
+    if (!workers_given && config.transport == Transport::Tcp)
+        config.workers = std::clamp(usable_cpu_count(), 1U, kMaxDefaultWorkers);
 
     apply_descriptor_limit(config);
-    if (!worker_override)
+    if (!workers_given)
         config.workers = std::min(config.workers, config.max_connections);
     if (config.max_connections == 0 || config.workers > config.max_connections)
         throw ConfigError("the effective connection limit must allow at least one slot per worker");
-    config.streaming_pipes = streaming_pipe_budget();
+    config.streaming_pipe_budget = read_streaming_pipe_budget();
     return config;
 }
 
 const std::optional<Endpoint>& backend_for(const Config& config, int family) {
     return family == AF_INET ? config.backend_ipv4 : config.backend_ipv6;
+}
+
+std::size_t worker_share(std::size_t total, std::size_t workers,
+                         std::size_t worker_index) noexcept {
+    return total / workers + (worker_index < total % workers ? 1 : 0);
 }
 
 std::string_view usage() {

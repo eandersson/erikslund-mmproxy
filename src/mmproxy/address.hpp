@@ -17,11 +17,14 @@ namespace erikslund::mmproxy {
 inline constexpr std::size_t kIpv4AddressBytes = 4;
 inline constexpr std::size_t kIpv6AddressBytes = 16;
 
+[[nodiscard]] std::size_t ip_address_size(int family) noexcept;
+
 struct IpAddress {
     int family{AF_UNSPEC};
     std::array<std::uint8_t, kIpv6AddressBytes> bytes{};
 
     [[nodiscard]] bool is_loopback() const noexcept;
+    [[nodiscard]] bool is_wildcard() const noexcept;
     auto operator<=>(const IpAddress&) const = default;
 };
 
@@ -50,15 +53,19 @@ parse_ip_address(std::string_view text, int family = AF_UNSPEC) noexcept;
 [[nodiscard]] SocketAddress to_socket_address(const Endpoint& endpoint) noexcept;
 [[nodiscard]] std::optional<Endpoint> from_socket_address(const sockaddr_storage& address) noexcept;
 [[nodiscard]] bool usable_transparent_source(const Endpoint& endpoint) noexcept;
-[[nodiscard]] IpAddress client_source(const IpAddress& address) noexcept;
-[[nodiscard]] bool claim_fits_relay(const Endpoint& claimed, const Endpoint& relay) noexcept;
+[[nodiscard]] IpAddress client_network(const IpAddress& address) noexcept;
+[[nodiscard]] bool relay_may_claim(const Endpoint& relay, const Endpoint& claimed) noexcept;
+[[nodiscard]] bool relay_may_claim(const Endpoint& relay,
+                                   const std::optional<Endpoint>& claimed) noexcept;
 
 class TrustList {
 public:
+    enum class Everyone { Count, Ignore };
+
     [[nodiscard]] bool add(std::string_view text);
     [[nodiscard]] bool contains(const IpAddress& address) const noexcept;
     [[nodiscard]] bool overlaps(const IpAddress& network, unsigned int prefix_bits,
-                                bool count_everyone = true) const noexcept;
+                                Everyone everyone = Everyone::Count) const noexcept;
     [[nodiscard]] bool trusts_everyone() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
 

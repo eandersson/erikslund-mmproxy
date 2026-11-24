@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "mmproxy/cgroup.hpp"
+#include "mmproxy/number.hpp"
 
 namespace erikslund::mmproxy {
 namespace {
@@ -44,14 +45,13 @@ std::string_view read_file(const FileDescriptor& file, std::array<char, Size>& b
 std::optional<std::uint64_t> parse_memory_max(std::string_view text) noexcept {
     if (text == kNoLimit)
         return std::nullopt;
-    std::uint64_t bytes = 0;
-    const auto [end, error] = std::from_chars(text.begin(), text.end(), bytes);
-    if (error != std::errc{} || end != text.end() || bytes == 0)
+    const auto bytes = parse_number<std::uint64_t>(text);
+    if (!bytes || *bytes == 0)
         return std::nullopt;
     return bytes;
 }
 
-std::optional<std::uint64_t> parse_file_pages(std::string_view stat) noexcept {
+std::optional<std::uint64_t> parse_file_cache_bytes(std::string_view stat) noexcept {
     std::size_t start = 0;
     while (start < stat.size()) {
         const auto end = std::min(stat.find('\n', start), stat.size());
@@ -74,20 +74,20 @@ std::optional<MemoryLimit> find_memory_limit() {
         const auto bytes = parse_memory_max(text);
         if (bytes && (!tightest || *bytes < tightest->bytes))
             tightest = MemoryLimit{.bytes = *bytes,
-                                   .usage = directory / "memory.current",
-                                   .stat = directory / "memory.stat",
-                                   .shared = directory != directories.front()};
+                                   .usage_path = directory / "memory.current",
+                                   .stat_path = directory / "memory.stat",
+                                   .from_parent_cgroup = directory != directories.front()};
     }
     return tightest;
 }
 
 MemoryGuard::MemoryGuard(const MemoryLimit& limit)
-    : usage_(::open(limit.usage.c_str(), O_RDONLY | O_CLOEXEC)),
-      stat_(::open(limit.stat.c_str(), O_RDONLY | O_CLOEXEC)),
+    : usage_file_(::open(limit.usage_path.c_str(), O_RDONLY | O_CLOEXEC)),
+      stat_file_(::open(limit.stat_path.c_str(), O_RDONLY | O_CLOEXEC)),
       threshold_bytes_(limit.bytes / kPercent * kPressurePercent) {}
 
 bool MemoryGuard::enabled() const noexcept {
-    return static_cast<bool>(usage_);
+    return static_cast<bool>(usage_file_);
 }
 
 std::uint64_t MemoryGuard::threshold_bytes() const noexcept {
@@ -96,11 +96,11 @@ std::uint64_t MemoryGuard::threshold_bytes() const noexcept {
 
 bool MemoryGuard::under_pressure() const noexcept {
     std::array<char, kUsageTextBytes> usage_text{};
-    const auto used = parse_count(read_file(usage_, usage_text));
+    const auto used = parse_count(read_file(usage_file_, usage_text));
     if (!used || *used < threshold_bytes_)
         return false;
     std::array<char, kStatTextBytes> stat_text{};
-    const auto cache = parse_file_pages(read_file(stat_, stat_text)).value_or(0);
+    const auto cache = parse_file_cache_bytes(read_file(stat_file_, stat_text)).value_or(0);
     return *used - std::min(*used, cache) >= threshold_bytes_;
 }
 

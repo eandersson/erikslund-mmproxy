@@ -13,14 +13,14 @@ namespace erikslund::mmproxy {
 
 struct MemoryLimit {
     std::uint64_t bytes;
-    std::filesystem::path usage; // that cgroup's memory.current
-    std::filesystem::path stat;  // that cgroup's memory.stat
+    std::filesystem::path usage_path; // that cgroup's memory.current
+    std::filesystem::path stat_path;  // that cgroup's memory.stat
     // The limit belongs to a parent cgroup, whose other members' memory also counts.
-    bool shared = false;
+    bool from_parent_cgroup = false;
 };
 
 [[nodiscard]] std::optional<std::uint64_t> parse_memory_max(std::string_view text) noexcept;
-[[nodiscard]] std::optional<std::uint64_t> parse_file_pages(std::string_view stat) noexcept;
+[[nodiscard]] std::optional<std::uint64_t> parse_file_cache_bytes(std::string_view stat) noexcept;
 [[nodiscard]] std::optional<MemoryLimit> find_memory_limit();
 
 class MemoryGuard {
@@ -33,8 +33,8 @@ public:
     [[nodiscard]] bool under_pressure() const noexcept;
 
 private:
-    FileDescriptor usage_;
-    FileDescriptor stat_;
+    FileDescriptor usage_file_;
+    FileDescriptor stat_file_;
     std::uint64_t threshold_bytes_ = 0;
 };
 

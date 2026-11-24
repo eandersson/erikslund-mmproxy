@@ -65,10 +65,10 @@ TEST_CASE("Only a relay on this host may claim a loopback client") {
     const auto local_relay = parse_endpoint("127.0.0.1:40000").value();
     const auto loopback_claim = parse_endpoint("127.0.0.1:45001").value();
     const auto routed_claim = parse_endpoint("198.51.100.7:45001").value();
-    CHECK_FALSE(claim_fits_relay(loopback_claim, remote_relay));
-    CHECK_FALSE(claim_fits_relay(parse_endpoint("[::1]:45001").value(), remote_relay));
-    CHECK(claim_fits_relay(loopback_claim, local_relay));
-    CHECK(claim_fits_relay(routed_claim, remote_relay));
+    CHECK_FALSE(relay_may_claim(remote_relay, loopback_claim));
+    CHECK_FALSE(relay_may_claim(remote_relay, parse_endpoint("[::1]:45001").value()));
+    CHECK(relay_may_claim(local_relay, loopback_claim));
+    CHECK(relay_may_claim(remote_relay, routed_claim));
 }
 
 TEST_CASE("Endpoints need brackets around IPv6 addresses and a numeric port") {
@@ -104,12 +104,12 @@ TEST_CASE("IPv4-mapped addresses unmap to IPv4, and other addresses stay unchang
 
 TEST_CASE("Client sources are IPv4 addresses and IPv6 /64 networks") {
     const auto ipv4 = parse_ip_address("192.0.2.20").value();
-    CHECK(client_source(ipv4) == ipv4);
-    CHECK(client_source(parse_ip_address("::ffff:192.0.2.20").value()) == ipv4);
-    CHECK(client_source(parse_ip_address("2001:db8:1:2:aaaa::1").value()) ==
+    CHECK(client_network(ipv4) == ipv4);
+    CHECK(client_network(parse_ip_address("::ffff:192.0.2.20").value()) == ipv4);
+    CHECK(client_network(parse_ip_address("2001:db8:1:2:aaaa::1").value()) ==
           parse_ip_address("2001:db8:1:2::").value());
     // NAT64 clients count by the IPv4 address they carry, not as one shared /64.
-    CHECK(client_source(parse_ip_address("64:ff9b::192.0.2.20").value()) == ipv4);
+    CHECK(client_network(parse_ip_address("64:ff9b::192.0.2.20").value()) == ipv4);
 }
 
 TEST_CASE("Socket addresses round-trip, and mapped kernel peers read back as IPv4") {

@@ -16,7 +16,7 @@ namespace erikslund::mmproxy {
 struct TcpShared {
     Balancer& balancer;
     FairShare& fair_share;
-    const MemoryGuard& memory;
+    const MemoryGuard& memory_guard;
 };
 
 void run_tcp(const std::stop_token& stop, const Config& config, FileDescriptor listener,

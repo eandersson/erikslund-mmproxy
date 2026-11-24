@@ -8,7 +8,7 @@ namespace erikslund::mmproxy {
 
 namespace {
 
-constexpr std::string_view kV1Prefix = "PROXY ";
+constexpr std::string_view kV1Signature = "PROXY ";
 constexpr std::string_view kV1Unknown = "UNKNOWN";
 constexpr std::size_t kLineEndingBytes = 2;
 constexpr std::array<std::uint8_t, 12> kV2Signature{
@@ -69,7 +69,7 @@ std::expected<ProxyHeader, ProxyError> parse_v1_addresses(std::string_view text,
 std::expected<ProxyHeader, ProxyError> parse_v1(std::span<const std::uint8_t> bytes) noexcept {
     const std::string_view prefix{reinterpret_cast<const char*>(bytes.data()),
                                   std::min(bytes.size(), kMaxProxyV1HeaderSize)};
-    if (!prefix.starts_with(kV1Prefix.substr(0, prefix.size())))
+    if (!prefix.starts_with(kV1Signature.substr(0, prefix.size())))
         return std::unexpected(ProxyError::Invalid);
 
     const std::size_t end = prefix.find_first_of("\r\n");
@@ -79,10 +79,10 @@ std::expected<ProxyHeader, ProxyError> parse_v1(std::span<const std::uint8_t> by
         return std::unexpected(error);
     }
 
-    if (prefix[end] != '\r' || prefix[end + 1] != '\n' || end < kV1Prefix.size())
+    if (prefix[end] != '\r' || prefix[end + 1] != '\n' || end < kV1Signature.size())
         return std::unexpected(ProxyError::Invalid);
 
-    const auto line = prefix.substr(kV1Prefix.size(), end - kV1Prefix.size());
+    const auto line = prefix.substr(kV1Signature.size(), end - kV1Signature.size());
     const std::size_t size = end + kLineEndingBytes;
     const std::size_t separator = line.find(' ');
     const auto protocol = line.substr(0, separator);
@@ -101,7 +101,8 @@ std::expected<ProxyHeader, ProxyError> parse_v1(std::span<const std::uint8_t> by
 
 std::expected<ProxyHeader, ProxyError>
 parse_v2_addresses(std::span<const std::uint8_t> address_bytes, int family,
-                   std::size_t address_size, std::size_t size) noexcept {
+                   std::size_t size) noexcept {
+    const std::size_t address_size = ip_address_size(family);
     const auto source_address_bytes = address_bytes.first(address_size);
     const auto destination_address_bytes = address_bytes.subspan(address_size, address_size);
     const std::size_t ports_offset = source_address_bytes.size() + destination_address_bytes.size();
@@ -144,21 +145,20 @@ std::expected<ProxyHeader, ProxyError> parse_v2(std::span<const std::uint8_t> by
     }
 
     const auto family_and_transport = bytes[kV2FamilyAndTransportOffset];
-    const auto family = family_and_transport >> kNibbleBits;
+    const auto wire_family = family_and_transport >> kNibbleBits;
     if ((family_and_transport & kLowNibbleMask) != static_cast<std::uint8_t>(transport) ||
-        (family != kV2Ipv4Family && family != kV2Ipv6Family))
+        (wire_family != kV2Ipv4Family && wire_family != kV2Ipv6Family))
         return std::unexpected(ProxyError::Unsupported);
 
-    const bool ipv4 = family == kV2Ipv4Family;
-    const std::size_t address_size = ipv4 ? kIpv4AddressBytes : kIpv6AddressBytes;
-    const std::size_t address_and_ports_size = 2 * (address_size + kWirePortBytes);
+    const int family = wire_family == kV2Ipv4Family ? AF_INET : AF_INET6;
+    const std::size_t address_and_ports_size = 2 * (ip_address_size(family) + kWirePortBytes);
     if (body_size < address_and_ports_size)
         return std::unexpected(ProxyError::Invalid);
     if (bytes.size() < size)
         return std::unexpected(ProxyError::NeedMore);
 
     const auto address_bytes = bytes.subspan(kProxyV2FixedHeaderSize, address_and_ports_size);
-    return parse_v2_addresses(address_bytes, ipv4 ? AF_INET : AF_INET6, address_size, size);
+    return parse_v2_addresses(address_bytes, family, size);
 }
 
 } // namespace
@@ -169,7 +169,7 @@ std::expected<ProxyHeader, ProxyError> parse_proxy_header(std::span<const std::u
         return std::unexpected(ProxyError::NeedMore);
     if (bytes.front() == kV2Signature.front())
         return parse_v2(bytes, transport);
-    if (bytes.front() != kV1Prefix.front())
+    if (bytes.front() != kV1Signature.front())
         return std::unexpected(ProxyError::Invalid);
     if (transport != ProxyTransport::Stream)
         return std::unexpected(ProxyError::Unsupported);

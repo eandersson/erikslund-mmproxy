@@ -15,9 +15,9 @@ FairShare::FairShare(std::size_t capacity)
       share_(std::max<std::size_t>(1, capacity / kShareDivisor)) {}
 
 bool FairShare::admit(const IpAddress& address) {
-    const auto source = client_source(address);
+    const auto network = client_network(address);
     const std::lock_guard guard(lock_);
-    auto& held = connections_[source];
+    auto& held = connections_[network];
     if (total_ >= contended_at_ && held >= share_)
         return false;
     ++held;
@@ -26,9 +26,9 @@ bool FairShare::admit(const IpAddress& address) {
 }
 
 void FairShare::release(const IpAddress& address) {
-    const auto source = client_source(address);
+    const auto network = client_network(address);
     const std::lock_guard guard(lock_);
-    const auto entry = connections_.find(source);
+    const auto entry = connections_.find(network);
     if (entry == connections_.end())
         return;
     --total_;

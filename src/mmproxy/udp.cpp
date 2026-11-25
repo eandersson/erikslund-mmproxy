@@ -68,6 +68,7 @@ struct Flow {
     FlowsByNetwork::iterator network_entry;
     IdleOrder::iterator network_position;
     Clock::time_point last_client{};
+    std::optional<std::uint16_t> last_reply_poll;
     std::uint32_t generation{};
 };
 
@@ -179,9 +180,12 @@ public:
                 throw_system_error("poll UDP sockets");
             }
 
+            ++polls_;
             expire_flows(Clock::now());
             for (int event_index = 0; event_index < ready && !stop.stop_requested(); ++event_index)
                 dispatch(events[static_cast<std::size_t>(event_index)]);
+            if (static_cast<std::size_t>(ready) < events.size())
+                last_short_poll_ = polls_;
         }
     }
 
@@ -431,10 +435,20 @@ private:
         join_network(slot, network);
         flow.key = key;
         flow.reply_path = path;
+        flow.last_reply_poll.reset();
         flow.backend = std::move(backend);
         free_slots_.pop_back();
         record_client_activity(flow, now);
         return slot;
+    }
+
+    [[nodiscard]] bool may_have_stayed_ready(Flow& flow) const {
+        const auto poll = static_cast<std::uint16_t>(polls_);
+        const auto previous = std::exchange(flow.last_reply_poll, poll);
+        if (!previous)
+            return false;
+        const auto polls_since_reply = static_cast<std::uint16_t>(poll - *previous);
+        return polls_since_reply <= polls_ - last_short_poll_;
     }
 
     void receive_backend_packets(std::size_t slot) {
@@ -444,6 +458,7 @@ private:
             close_flow(slot);
             return;
         }
+        const bool drain = may_have_stayed_ready(flow);
         for (std::size_t packet = 0; packet < kPacketsPerEvent; ++packet) {
             const auto received = ::recv(flow.backend.get(), packet_.data(), packet_.size(),
                                          MSG_TRUNC);
@@ -469,6 +484,8 @@ private:
                 continue;
             }
             refresh_idle_deadline(flow, now);
+            if (!drain)
+                return;
         }
     }
 
@@ -483,6 +500,8 @@ private:
     FlowsByNetwork flows_by_network_;
     std::set<std::pair<std::size_t, IpAddress>> networks_by_flow_count_;
     Clock::duration client_silence_limit_;
+    std::uint64_t polls_ = 0;
+    std::uint64_t last_short_poll_ = 0;
     std::array<std::uint8_t, kMaxPacketBytes> packet_{};
 };
 

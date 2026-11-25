@@ -188,9 +188,14 @@ struct Connection {
     std::optional<IpAddress> counted_client;
     std::uint32_t client_events = 0;
     std::uint32_t backend_events = 0;
+    bool in_pipe_sweep = false;
 
     [[nodiscard]] Direction& direction_from(Side side) {
         return side == Side::Client ? to_backend : to_client;
+    }
+
+    [[nodiscard]] bool holds_pipe() const {
+        return to_backend.pipe.has_value() || to_client.pipe.has_value();
     }
 
     [[nodiscard]] int socket(Side side) const {
@@ -557,10 +562,23 @@ private:
         if (now < next_pipe_sweep_)
             return;
         next_pipe_sweep_ = now + kPipeSweepInterval;
-        for (auto& entry : connections_) {
-            release_idle_pipe(entry.second.to_backend);
-            release_idle_pipe(entry.second.to_client);
-        }
+        std::erase_if(pipe_holders_, [this](ConnectionId id) {
+            const auto entry = connections_.find(id);
+            if (entry == connections_.end())
+                return true;
+            auto& connection = entry->second;
+            release_idle_pipe(connection.to_backend);
+            release_idle_pipe(connection.to_client);
+            connection.in_pipe_sweep = connection.holds_pipe();
+            return !connection.in_pipe_sweep;
+        });
+    }
+
+    void join_pipe_sweep(ConnectionId id, Connection& connection) {
+        if (connection.in_pipe_sweep || !connection.holds_pipe())
+            return;
+        connection.in_pipe_sweep = true;
+        pipe_holders_.push_back(id);
     }
 
     void release_idle_pipe(Direction& direction) {
@@ -801,6 +819,7 @@ private:
         if (download != PumpStatus::Ok)
             return pump_failed(download, Side::Backend);
 
+        join_pipe_sweep(id, connection);
         if (connection.to_backend.eof && connection.to_client.eof)
             return Result::Done;
         if (moved)
@@ -878,6 +897,7 @@ private:
     PipePool pipes_;
     std::vector<std::uint8_t> scratch_ = std::vector<std::uint8_t>(kScratchBytes);
     Connections connections_;
+    std::vector<ConnectionId> pipe_holders_;
     std::array<DeadlineQueue, kPhaseCount> deadlines_;
     ConnectionId next_id_ = 1;
     std::uint32_t listener_events_ = 0;

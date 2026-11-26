@@ -346,6 +346,12 @@ std::size_t unread_bytes(int socket) {
     return queue_bytes(socket, FIONREAD);
 }
 
+[[nodiscard]] bool stopped_sending(int socket) {
+    std::uint8_t byte = 0;
+    const auto received = ::recv(socket, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+    return received == 0 || (received < 0 && !is_retryable(errno));
+}
+
 [[nodiscard]] bool report_writable_only_when_sent(int socket) {
     const int low_water = 1;
     return ::setsockopt(socket, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &low_water, sizeof(low_water)) ==
@@ -895,7 +901,7 @@ private:
     Result await_flush(ConnectionId id, Connection& connection, Clock::time_point now) {
         const int survivor = connection.socket(opposite(connection.failed_side));
         connection.awaiting_flush = true;
-        if (!connection.reset_survivor && unread_bytes(survivor) == 0)
+        if (!connection.reset_survivor && stopped_sending(survivor))
             return Result::Done;
         if (unacknowledged_bytes(survivor) == 0)
             return close_survivor(connection);

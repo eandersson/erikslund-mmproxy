@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <list>
 #include <optional>
@@ -47,6 +48,8 @@ constexpr auto kMemoryPollInterval = std::chrono::milliseconds(25);
 constexpr auto kMemoryCheckInterval = std::chrono::milliseconds(5);
 constexpr std::size_t kShedDivisor = 8;
 constexpr auto kOrphanTimeout = std::chrono::milliseconds(60'000);
+constexpr auto kBlockedPeerTimeout = std::chrono::milliseconds(5'000);
+constexpr auto kAcknowledgementCheckInterval = std::chrono::milliseconds(20);
 constexpr std::uint64_t kListenerToken = 0;
 constexpr std::uint64_t kInboxToken = 1;
 constexpr unsigned int kSideBits = 1;
@@ -54,10 +57,15 @@ constexpr std::uint64_t kSideMask = (std::uint64_t{1} << kSideBits) - 1;
 constexpr std::uint32_t kReadEvents = EPOLLIN | EPOLLRDHUP;
 constexpr std::uint32_t kReadReady = kReadEvents | EPOLLHUP;
 constexpr std::uint32_t kWriteReady = EPOLLOUT | EPOLLHUP;
+constexpr std::uint32_t kSocketChanges = EPOLLOUT | EPOLLET;
 
-enum class Phase : std::uint8_t { Header, Connecting, Forwarding, Salvaging };
-constexpr std::size_t kPhaseCount = 4;
-static_assert(static_cast<std::size_t>(Phase::Salvaging) + 1 == kPhaseCount);
+enum class Phase : std::uint8_t { Header, Connecting, Forwarding, Salvaging, Closing };
+constexpr std::size_t kPhaseCount = 5;
+static_assert(static_cast<std::size_t>(Phase::Closing) + 1 == kPhaseCount);
+
+bool is_draining(Phase phase) {
+    return phase == Phase::Salvaging || phase == Phase::Closing;
+}
 
 enum class Side : std::uint8_t { Client, Backend };
 
@@ -74,9 +82,9 @@ enum class Result {
 
 enum class PumpStatus {
     Ok,
+    SourceEnded,
     SourceFailed,
     DestinationFailed,
-    DestinationFailedAfterItsEnd,
     CopyInstead,
 };
 
@@ -108,10 +116,7 @@ Side side_that_failed(PumpStatus status, Side source) {
 }
 
 PumpStatus write_failure(int error) {
-    if (is_retryable(error))
-        return PumpStatus::Ok;
-    return error == EPIPE ? PumpStatus::DestinationFailedAfterItsEnd :
-                            PumpStatus::DestinationFailed;
+    return is_retryable(error) ? PumpStatus::Ok : PumpStatus::DestinationFailed;
 }
 
 Readiness event_readiness(Side source, Side event_side, std::uint32_t events) {
@@ -180,7 +185,6 @@ struct Direction {
     bool use_splice = false;
     bool spliced_recently = false;
     bool eof = false;
-    bool source_broken = false;
 
     [[nodiscard]] bool has_staged() const { return staged_sent != staged.size(); }
     [[nodiscard]] bool pending() const { return has_staged() || piped_bytes != 0; }
@@ -205,10 +209,12 @@ struct Connection {
     Phase phase = Phase::Header;
     Side failed_side = Side::Client;
     Clock::time_point expires_at{};
+    Clock::time_point last_progress{};
     std::optional<DeadlineQueue::iterator> deadline_position;
     std::optional<IpAddress> counted_client;
     std::uint32_t client_events = 0;
     std::uint32_t backend_events = 0;
+    std::size_t outstanding = 0;
     bool in_pipe_sweep = false;
     bool reset_survivor = false;
     bool awaiting_flush = false;
@@ -285,17 +291,59 @@ std::chrono::milliseconds orphan_timeout(const Config& config) {
     return std::min(config.user_timeout, kOrphanTimeout);
 }
 
-std::chrono::milliseconds salvage_timeout(const Config& config) {
+std::chrono::milliseconds capped_by_idle(const Config& config, std::chrono::milliseconds limit) {
     if (config.idle_timeout.count() == 0)
-        return kOrphanTimeout;
-    return std::min(config.idle_timeout, kOrphanTimeout);
+        return limit;
+    return std::min(config.idle_timeout, limit);
+}
+
+std::chrono::milliseconds salvage_check_interval(const Config& config) {
+    return std::max(capped_by_idle(config, kBlockedPeerTimeout) / 2,
+                    std::chrono::milliseconds(1));
+}
+
+[[nodiscard]] bool fin_received(int socket) {
+    const int enabled = 1;
+    if (::setsockopt(socket, IPPROTO_TCP, TCP_INQ, &enabled, sizeof(enabled)) != 0)
+        return true;
+    std::uint8_t byte = 0;
+    iovec buffer{.iov_base = &byte, .iov_len = sizeof(byte)};
+    alignas(cmsghdr) std::array<std::uint8_t, CMSG_SPACE(sizeof(int))> control{};
+    msghdr message{};
+    message.msg_iov = &buffer;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    if (::recvmsg(socket, &message, MSG_PEEK | MSG_DONTWAIT) != 0)
+        return false;
+    for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != IPPROTO_TCP || header->cmsg_type != TCP_CM_INQ ||
+            header->cmsg_len < CMSG_LEN(sizeof(int)))
+            continue;
+        int unread = 0;
+        std::memcpy(&unread, CMSG_DATA(header), sizeof(unread));
+        return unread != 0;
+    }
+    return (message.msg_flags & MSG_CTRUNC) != 0;
+}
+
+std::size_t queue_bytes(int socket, unsigned long request) {
+    int bytes = 0;
+    if (::ioctl(socket, request, &bytes) != 0 || bytes < 0)
+        return 0;
+    return static_cast<std::size_t>(bytes);
 }
 
 std::size_t unsent_bytes(int socket) {
-    int unsent = 0;
-    if (::ioctl(socket, SIOCOUTQNSD, &unsent) != 0 || unsent < 0)
-        return 0;
-    return static_cast<std::size_t>(unsent);
+    return queue_bytes(socket, SIOCOUTQNSD);
+}
+
+std::size_t unacknowledged_bytes(int socket) {
+    return queue_bytes(socket, TIOCOUTQ);
+}
+
+std::size_t unread_bytes(int socket) {
+    return queue_bytes(socket, FIONREAD);
 }
 
 [[nodiscard]] bool report_writable_only_when_sent(int socket) {
@@ -408,8 +456,7 @@ PumpStatus copy_through(Direction& direction, int source, int destination,
     if (received < 0)
         return is_retryable(errno) ? PumpStatus::Ok : PumpStatus::SourceFailed;
     if (received == 0)
-        return direction.source_broken ? PumpStatus::SourceFailed :
-                                         finish_direction(direction, destination);
+        return PumpStatus::SourceEnded;
     const auto chunk = scratch.first(static_cast<std::size_t>(received));
     const auto sent = ::send(destination, chunk.data(), chunk.size(), MSG_NOSIGNAL);
     if (sent < 0 && !is_retryable(errno))
@@ -583,6 +630,7 @@ private:
             return;
         case Phase::Forwarding:
         case Phase::Salvaging:
+        case Phase::Closing:
             return;
         }
     }
@@ -591,15 +639,45 @@ private:
         for (auto& queue : deadlines_) {
             while (!queue.empty()) {
                 const auto entry = connections_.find(queue.front());
-                if (entry->second.expires_at > now)
+                auto& connection = entry->second;
+                if (connection.expires_at > now)
                     break;
-                count_expiry(entry->second.phase);
-                if (entry->second.phase == Phase::Salvaging || held_bytes(entry->second) != 0)
+                if (is_draining(connection.phase)) {
+                    if (const auto result = recheck_drain(entry->first, connection, now);
+                        result != Result::Keep)
+                        close_connection(entry, result);
+                    continue;
+                }
+                count_expiry(connection.phase);
+                if (held_bytes(connection) != 0)
                     remove_with_reset(entry);
                 else
                     remove(entry);
             }
         }
+    }
+
+    Result recheck_drain(ConnectionId id, Connection& connection, Clock::time_point now) {
+        const int survivor = connection.socket(opposite(connection.failed_side));
+        const auto outstanding = unacknowledged_bytes(survivor);
+        if (connection.awaiting_flush && outstanding == 0)
+            return close_survivor(connection);
+        if (outstanding < std::exchange(connection.outstanding, outstanding))
+            connection.last_progress = now;
+        if (stalled(connection, survivor, now))
+            return Result::Salvaged;
+        const auto interval = connection.phase == Phase::Closing ? kAcknowledgementCheckInterval :
+                                                                   salvage_check_interval(config_);
+        enter_phase(id, connection, connection.phase, now, interval);
+        return Result::Keep;
+    }
+
+    [[nodiscard]] bool stalled(const Connection& connection, int survivor,
+                               Clock::time_point now) const {
+        const auto quiet = now - connection.last_progress;
+        if (quiet >= capped_by_idle(config_, kOrphanTimeout))
+            return true;
+        return quiet >= capped_by_idle(config_, kBlockedPeerTimeout) && unread_bytes(survivor) != 0;
     }
 
     void sweep_pipes(Clock::time_point now) {
@@ -740,10 +818,18 @@ private:
             std::uint32_t survivor_events = 0;
             if (rescued.pending() || connection.awaiting_flush)
                 survivor_events = EPOLLOUT;
+            if (connection.awaiting_flush && !connection.reset_survivor)
+                survivor_events = kSocketChanges;
             client_events = failed == Side::Client ? failed_events : survivor_events;
             backend_events = failed == Side::Backend ? failed_events : survivor_events;
             break;
         }
+        case Phase::Closing:
+            if (connection.failed_side == Side::Client)
+                backend_events = kSocketChanges;
+            else
+                client_events = kSocketChanges;
+            break;
         }
         return update_events(epoll_.get(), connection.client.get(), event_token(id, Side::Client),
                              connection.client_events, client_events) &&
@@ -757,15 +843,19 @@ private:
         return Result::BackendFailed;
     }
 
-    Result side_failed(Side side) {
-        if (side == Side::Backend)
-            return backend_failed(BackendFailure::Forwarding);
-        return Result::ClientClosed;
-    }
-
     PumpStatus pump_from(Connection& connection, Side source, Readiness ready, bool& moved) {
-        return pump(connection.direction_from(source), connection.socket(source),
-                    connection.socket(opposite(source)), ready, pipes_, scratch_, moved);
+        auto& direction = connection.direction_from(source);
+        const int from = connection.socket(source);
+        const int to = connection.socket(opposite(source));
+        const auto status = pump(direction, from, to, ready, pipes_, scratch_, moved);
+        if (status != PumpStatus::SourceEnded)
+            return status;
+        const bool error_may_be_hidden =
+            connection.phase == Phase::Salvaging ||
+            connection.direction_from(opposite(source)).piped_bytes != 0;
+        if (error_may_be_hidden && !fin_received(from))
+            return PumpStatus::SourceFailed;
+        return finish_direction(direction, to);
     }
 
     void abandon(Direction& direction) {
@@ -779,12 +869,10 @@ private:
     Result salvage(ConnectionId id, Connection& connection, Readiness ready,
                    Clock::time_point now) {
         const Side failed = connection.failed_side;
-        const int survivor = connection.socket(opposite(failed));
         auto& rescued = connection.direction_from(failed);
         bool moved = false;
         const auto status = pump_from(connection, failed, ready, moved);
-        if (status == PumpStatus::DestinationFailed ||
-            status == PumpStatus::DestinationFailedAfterItsEnd)
+        if (status == PumpStatus::DestinationFailed)
             return Result::Salvaged;
         join_pipe_sweep(id, connection);
         const bool source_is_empty =
@@ -794,46 +882,79 @@ private:
             connection.reset_survivor = true;
         }
         if (moved)
-            enter_phase(id, connection, Phase::Salvaging, now, salvage_timeout(config_));
+            connection.last_progress = now;
         if (!rescued.eof || rescued.pending() || connection.awaiting_flush)
             return Result::Keep;
-        if (!connection.reset_survivor)
-            return Result::Done;
-        if (!report_writable_only_when_sent(survivor) || unsent_bytes(survivor) == 0)
-            return Result::Salvaged;
+        return await_flush(id, connection, now);
+    }
+
+    static Result close_survivor(const Connection& connection) {
+        return connection.reset_survivor ? Result::Salvaged : Result::Done;
+    }
+
+    Result await_flush(ConnectionId id, Connection& connection, Clock::time_point now) {
+        const int survivor = connection.socket(opposite(connection.failed_side));
         connection.awaiting_flush = true;
+        if (!connection.reset_survivor && unread_bytes(survivor) == 0)
+            return Result::Done;
+        if (unacknowledged_bytes(survivor) == 0)
+            return close_survivor(connection);
+        if (!connection.reset_survivor)
+            return Result::Keep;
+        if (report_writable_only_when_sent(survivor) && unsent_bytes(survivor) != 0)
+            return Result::Keep;
+        return enter_closing(id, connection, now);
+    }
+
+    Result enter_closing(ConnectionId id, Connection& connection, Clock::time_point now) {
+        connection.last_progress = now;
+        connection.outstanding =
+            unacknowledged_bytes(connection.socket(opposite(connection.failed_side)));
+        enter_phase(id, connection, Phase::Closing, now, kAcknowledgementCheckInterval);
+        return Result::Keep;
+    }
+
+    Result recheck_flush(ConnectionId id, Connection& connection, Clock::time_point now) {
+        const int survivor = connection.socket(opposite(connection.failed_side));
+        if (unacknowledged_bytes(survivor) == 0)
+            return close_survivor(connection);
+        if (connection.phase == Phase::Salvaging && connection.reset_survivor &&
+            unsent_bytes(survivor) == 0)
+            return enter_closing(id, connection, now);
         return Result::Keep;
     }
 
     Result start_salvage(ConnectionId id, Connection& connection, Side failed,
                          Clock::time_point now) {
-        const auto closed = side_failed(failed);
-        if (connection.direction_from(failed).eof)
-            return closed;
+        if (failed == Side::Backend)
+            metrics_.count_backend_failure(BackendFailure::Forwarding);
         abandon(connection.direction_from(opposite(failed)));
         connection.failed_side = failed;
-        enter_phase(id, connection, Phase::Salvaging, now, salvage_timeout(config_));
+        connection.last_progress = now;
+        connection.outstanding = unacknowledged_bytes(connection.socket(opposite(failed)));
+        enter_phase(id, connection, Phase::Salvaging, now, salvage_check_interval(config_));
         return salvage(id, connection, kFullyReady, now);
-    }
-
-    Result pump_failed(ConnectionId id, Connection& connection, PumpStatus status, Side source,
-                       Clock::time_point now) {
-        const Side failed = side_that_failed(status, source);
-        connection.direction_from(failed).source_broken =
-            status != PumpStatus::DestinationFailedAfterItsEnd;
-        return start_salvage(id, connection, failed, now);
     }
 
     Result resume_salvage(ConnectionId id, Connection& connection, Side side,
                           std::uint32_t events, Clock::time_point now) {
         if (side == connection.failed_side)
             return salvage(id, connection, Readiness{.source_readable = true}, now);
-        if ((events & EPOLLERR) != 0)
+        if ((events & EPOLLERR) != 0 || (connection.reset_survivor && (events & EPOLLHUP) != 0))
             return Result::Salvaged;
         if (connection.awaiting_flush)
-            return unsent_bytes(connection.socket(side)) == 0 ? Result::Salvaged : Result::Keep;
+            return recheck_flush(id, connection, now);
         const bool writable = (events & kWriteReady) != 0;
         return salvage(id, connection, Readiness{.destination_writable = writable}, now);
+    }
+
+    Result resume_closing(ConnectionId id, Connection& connection, Side side,
+                          std::uint32_t events, Clock::time_point now) {
+        if (side == connection.failed_side)
+            return Result::Keep;
+        if ((events & (EPOLLERR | EPOLLHUP)) != 0)
+            return Result::Salvaged;
+        return recheck_flush(id, connection, now);
     }
 
     Result begin_forwarding(ConnectionId id, Connection& connection, Clock::time_point now) {
@@ -843,7 +964,7 @@ private:
         bool moved = false;
         const auto sent = send_staged(connection.to_backend, connection.backend.get(), moved);
         if (sent != PumpStatus::Ok)
-            return pump_failed(id, connection, sent, Side::Client, now);
+            return start_salvage(id, connection, side_that_failed(sent, Side::Client), now);
         return Result::Keep;
     }
 
@@ -914,10 +1035,8 @@ private:
         socklen_t length = sizeof(error);
         if (::getsockopt(connection.backend.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0)
             return backend_failed(BackendFailure::Connect);
-        if (error == ECONNRESET) {
-            connection.to_client.source_broken = true;
+        if (error == ECONNRESET || error == EPIPE)
             return start_salvage(id, connection, Side::Backend, now);
-        }
         if (error != 0)
             return backend_failed(BackendFailure::Connect);
         return begin_forwarding(id, connection, now);
@@ -931,11 +1050,11 @@ private:
         const auto upload_ready = event_readiness(Side::Client, side, events);
         const auto upload = pump_from(connection, Side::Client, upload_ready, moved);
         if (upload != PumpStatus::Ok)
-            return pump_failed(id, connection, upload, Side::Client, now);
+            return start_salvage(id, connection, side_that_failed(upload, Side::Client), now);
         const auto download_ready = event_readiness(Side::Backend, side, events);
         const auto download = pump_from(connection, Side::Backend, download_ready, moved);
         if (download != PumpStatus::Ok)
-            return pump_failed(id, connection, download, Side::Backend, now);
+            return start_salvage(id, connection, side_that_failed(download, Side::Backend), now);
 
         join_pipe_sweep(id, connection);
         if (connection.to_backend.eof && connection.to_client.eof)
@@ -956,6 +1075,8 @@ private:
             return forward(id, connection, side, events, now);
         case Phase::Salvaging:
             return resume_salvage(id, connection, side, events, now);
+        case Phase::Closing:
+            return resume_closing(id, connection, side, events, now);
         }
         std::unreachable();
     }
@@ -1002,8 +1123,14 @@ private:
                 return;
             result = Result::ResourceLimit;
         }
+        close_connection(entry, result);
+    }
+
+    void close_connection(Connections::iterator entry, Result result) {
         count_close(result);
-        if (result == Result::Salvaged)
+        const bool abort = result == Result::Salvaged ||
+                           (result == Result::ResourceLimit && is_draining(entry->second.phase));
+        if (abort)
             remove_with_reset(entry);
         else
             remove(entry);
